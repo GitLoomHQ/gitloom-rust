@@ -37,8 +37,14 @@ pub struct ConversationOptions {
     /// Compact after this many exchanges regardless of tokens. Default 5;
     /// Some(0) disables the cadence. Compaction is also the memory trigger.
     pub compact_every: Option<u32>,
-    /// Produces compaction summaries. Compaction is refused without one.
+    /// Produces compaction summaries locally — GitLoom never sees the
+    /// conversation. Compaction is refused when neither this nor
+    /// `summarize_server` is set.
     pub summarize: Option<Summarizer>,
+    /// Hands summarization to GitLoom's own model instead: the turns are
+    /// already stored there, and the client needs no model wired in. Used
+    /// when `summarize` is None. Costs one chat from the account's meter.
+    pub summarize_server: bool,
     /// Where memories land and are recalled from.
     pub namespace: Option<String>,
     /// Memory mode. Default Query.
@@ -208,7 +214,9 @@ impl Conversation {
         }
         self.exchanges += batch.iter().filter(|m| m.role == "assistant").count() as u32;
 
-        if self.opts.summarize.is_some() && (self.would_overflow(&batch) || self.cadence_due()) {
+        if (self.opts.summarize.is_some() || self.opts.summarize_server)
+            && (self.would_overflow(&batch) || self.cadence_due())
+        {
             self.compact().await?;
         }
 
@@ -236,8 +244,11 @@ impl Conversation {
     /// Summarize what the window can no longer hold and hand the evicted turns
     /// to memory ingestion.
     pub async fn compact(&mut self) -> Result<Option<String>, Error> {
+        if self.opts.summarize.is_none() && self.opts.summarize_server {
+            return self.compact_on_server().await;
+        }
         let summarize = self.opts.summarize.as_ref().ok_or_else(|| {
-            Error::Usage("compaction needs a summarizer; without one the evicted turns would be dropped".into())
+            Error::Usage("compaction needs a summarizer or summarize_server; without one the evicted turns would be dropped".into())
         })?;
         let mut evicted_len = self.evictable_len();
         if evicted_len == 0 {
@@ -271,6 +282,86 @@ impl Conversation {
         self.exchanges = 0;
         self.reported_tokens = 0;
         Ok(Some(summary))
+    }
+
+    /// Server-side compaction: GitLoom's own model writes the summary from
+    /// the stored turns.
+    async fn compact_on_server(&mut self) -> Result<Option<String>, Error> {
+        let mut evicted_len = self.evictable_len();
+        if evicted_len == 0 {
+            if self.history.len() < 2 {
+                return Ok(None);
+            }
+            let keep = 2.min(self.history.len() - 1);
+            evicted_len = self.history.len() - keep;
+        }
+        let from = self.first_live_seq;
+        let to = from + evicted_len as i64 - 1;
+        #[derive(Deserialize)]
+        struct Compacted {
+            #[serde(default)]
+            summary: String,
+        }
+        let res: Compacted = self
+            .client
+            .request(
+                reqwest::Method::POST,
+                &format!("/v1/conversations/{}/compact", self.id),
+                Some(json!({"branch": self.branch, "auto": true, "from_seq": from, "to_seq": to})),
+            )
+            .await?;
+        self.summary = if self.summary.is_empty() {
+            res.summary.clone()
+        } else {
+            format!("{}\n\nThen: {}", self.summary, res.summary)
+        };
+        self.history.drain(..evicted_len);
+        self.first_live_seq = to + 1;
+        self.exchanges = 0;
+        self.reported_tokens = 0;
+        Ok(Some(res.summary))
+    }
+
+    /// The proxy: one exchange where the SDK does everything but the provider
+    /// call. `complete` receives the prepared window — memory context and
+    /// compaction summary already folded in as a leading system message — and
+    /// returns the assistant's reply with the provider's usage. Both turns are
+    /// then stored, and compaction runs on cadence.
+    pub async fn exchange<F, Fut>(
+        &mut self,
+        fresh: Vec<Message>,
+        complete: F,
+    ) -> Result<Message, Error>
+    where
+        F: FnOnce(Vec<Message>) -> Fut,
+        Fut: std::future::Future<Output = Result<(Message, Option<Usage>), Error>>,
+    {
+        let last_user = fresh
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.text())
+            .unwrap_or_default();
+        let context = self.with_context(&last_user).await.unwrap_or(None);
+
+        let mut window = self.for_model();
+        if let Some(ctx) = context {
+            window.insert(
+                0,
+                Message {
+                    role: "system".into(),
+                    content: Content::Text(ctx),
+                    ..Default::default()
+                },
+            );
+        }
+        window.extend(fresh.iter().cloned());
+
+        let (reply, usage) = complete(window).await?;
+        let mut stored = fresh;
+        stored.push(reply.clone());
+        self.append(stored, usage.as_ref()).await?;
+        Ok(reply)
     }
 
     /// Fork a new branch after `seq` and switch to it. Nothing is deleted.

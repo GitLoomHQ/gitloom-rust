@@ -24,7 +24,7 @@ async fn server() -> MockServer {
         .await;
     Mock::given(method("POST"))
         .and(path_regex(r"/v1/conversations/.+/compact$"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"compacted": true})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"compacted": true, "summary": "server summary"})))
         .mount(&s)
         .await;
     Mock::given(method("POST"))
@@ -133,4 +133,61 @@ async fn usage_accepts_both_spellings() {
     let anthropic = Usage { input_tokens: Some(10), output_tokens: Some(5), ..Default::default() };
     assert_eq!(openai.total(), 15);
     assert_eq!(anthropic.total(), 15);
+}
+
+#[tokio::test]
+async fn server_side_compaction_asks_gitloom() {
+    let s = server().await;
+    let client = Client::new("gl_test").with_base_url(s.uri());
+    let mut o = opts("claude-sonnet-5", false);
+    o.summarize_server = true;
+    o.compact_every = Some(1);
+    let mut conv = Conversation::create(&client, "c1", o).await.unwrap();
+
+    for _ in 0..2 {
+        conv.append(vec![Message::user("q"), Message::assistant("a")], None)
+            .await
+            .unwrap();
+    }
+    let reqs = s.received_requests().await.unwrap();
+    let auto = reqs.iter().find(|r| r.url.path().ends_with("/compact")).expect("no compaction");
+    let body: Value = auto.body_json().unwrap();
+    assert_eq!(body["auto"], true);
+    assert!(body.get("summary").is_none(), "auto must not send a client summary");
+}
+
+#[tokio::test]
+async fn exchange_is_the_proxy() {
+    let s = server().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/retrieve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "namespace": "ns",
+            "hits": [{"path": "a.md", "score": 1.0, "snippet": "prefers Rust"}],
+            "millis": 1
+        })))
+        .mount(&s)
+        .await;
+    let client = Client::new("gl_test").with_base_url(s.uri());
+    let mut conv = Conversation::create(&client, "c1", opts("gpt-4o", false)).await.unwrap();
+
+    let reply = conv
+        .exchange(vec![Message::user("what do I prefer?")], |window| async move {
+            // The SDK prepared everything: memory context leads, the user
+            // message closes.
+            let first = window.first().unwrap();
+            assert_eq!(first.role, "system");
+            assert!(first.text().contains("prefers Rust"));
+            assert_eq!(window.last().unwrap().text(), "what do I prefer?");
+            Ok((Message::assistant("you prefer Rust"), None))
+        })
+        .await
+        .unwrap();
+    assert_eq!(reply.text(), "you prefer Rust");
+
+    // Both turns stored without the caller appending anything.
+    let reqs = s.received_requests().await.unwrap();
+    let append = reqs.iter().find(|r| r.url.path().ends_with("/messages")).unwrap();
+    let body: Value = append.body_json().unwrap();
+    assert_eq!(body["messages"].as_array().unwrap().len(), 2);
 }

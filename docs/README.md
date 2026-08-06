@@ -80,4 +80,4 @@ returns.
 
 ## Docs
 
-https://gitloom.cloud/docs/sdk-rust.html
+https://docs.gitloom.cloud/documentation/rust

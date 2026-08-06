@@ -6,7 +6,7 @@ description = "Rust SDK for GitLoom: conversations that cannot outgrow their con
 license = "MIT"
 repository = "https://github.com/GitLoomHQ/gitloom-rust"
 homepage = "https://gitloom.cloud"
-documentation = "https://gitloom.cloud/docs/sdk-rust.html"
+documentation = "https://docs.gitloom.cloud/documentation/rust"
 keywords = ["llm", "memory", "openai", "anthropic", "context"]
 categories = ["api-bindings"]
 

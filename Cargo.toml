@@ -1,0 +1,27 @@
+[package]
+name = "gitloom"
+version = "0.1.0"
+edition = "2021"
+description = "Rust SDK for GitLoom: conversations that cannot outgrow their context window, backed by a memory the model can consult"
+license = "MIT"
+repository = "https://github.com/GitLoomHQ/gitloom-rust"
+homepage = "https://gitloom.cloud"
+documentation = "https://gitloom.cloud/docs/sdk-rust.html"
+keywords = ["llm", "memory", "openai", "anthropic", "context"]
+categories = ["api-bindings"]
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+base64 = "0.22"
+async-openai = { version = "0.28", optional = true }
+
+[features]
+default = []
+openai = ["dep:async-openai"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+wiremock = "0.6"

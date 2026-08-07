@@ -11,7 +11,11 @@ const DEFAULT_BASE_URL: &str = "https://api.gitloom.cloud";
 pub enum Error {
     /// The API refused, with its machine-readable code.
     #[error("gitloom: {message} ({status} {code})")]
-    Api { status: u16, code: String, message: String },
+    Api {
+        status: u16,
+        code: String,
+        message: String,
+    },
     #[error("gitloom: transport: {0}")]
     Transport(#[from] reqwest::Error),
     #[error("gitloom: {0}")]
@@ -100,7 +104,11 @@ impl Client {
 
     /// Retrieve what is known that bears on the query. Every hit carries its
     /// evidence: per-arm scores, git history with the last diff, relations.
-    pub async fn recall(&self, query: &str, namespace: Option<&str>) -> Result<RecallResult, Error> {
+    pub async fn recall(
+        &self,
+        query: &str,
+        namespace: Option<&str>,
+    ) -> Result<RecallResult, Error> {
         let ns = namespace.unwrap_or(&self.namespace);
         let path = format!(
             "/v1/retrieve?q={}&namespace={}",
@@ -112,7 +120,11 @@ impl Client {
 
     /// Retrieval rendered as one system-message string; None when nothing
     /// relevant is stored.
-    pub async fn context(&self, query: &str, namespace: Option<&str>) -> Result<Option<String>, Error> {
+    pub async fn context(
+        &self,
+        query: &str,
+        namespace: Option<&str>,
+    ) -> Result<Option<String>, Error> {
         let res = self.recall(query, namespace).await?;
         if res.hits.is_empty() {
             return Ok(None);
@@ -144,7 +156,8 @@ impl Client {
 
     /// The attachment's description plus a short-lived URL for its bytes.
     pub async fn get_media(&self, id: &str) -> Result<MediaInfo, Error> {
-        self.request(reqwest::Method::GET, &format!("/v1/media/{id}"), None).await
+        self.request(reqwest::Method::GET, &format!("/v1/media/{id}"), None)
+            .await
     }
 
     /// Make a namespace exist. Idempotent.
@@ -179,14 +192,20 @@ fn error_from(status: u16, raw: &[u8]) -> Error {
             _ => {}
         }
     }
-    Error::Api { status, code, message }
+    Error::Api {
+        status,
+        code,
+        message,
+    }
 }
 
 pub(crate) fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             b' ' => out.push('+'),
             _ => out.push_str(&format!("%{b:02X}")),
         }

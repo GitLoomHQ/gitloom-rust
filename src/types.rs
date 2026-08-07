@@ -18,10 +18,18 @@ pub struct Message {
 
 impl Message {
     pub fn user(text: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: Content::Text(text.into()), ..Default::default() }
+        Self {
+            role: "user".into(),
+            content: Content::Text(text.into()),
+            ..Default::default()
+        }
     }
     pub fn assistant(text: impl Into<String>) -> Self {
-        Self { role: "assistant".into(), content: Content::Text(text.into()), ..Default::default() }
+        Self {
+            role: "assistant".into(),
+            content: Content::Text(text.into()),
+            ..Default::default()
+        }
     }
     /// The flattened text, whatever shape the content takes.
     pub fn text(&self) -> String {
@@ -77,15 +85,26 @@ pub struct PartData {
 
 impl Part {
     pub fn text_part(text: impl Into<String>) -> Self {
-        Self { kind: "text".into(), text: Some(text.into()), ..Default::default() }
+        Self {
+            kind: "text".into(),
+            text: Some(text.into()),
+            ..Default::default()
+        }
     }
     pub fn image(media_id: impl Into<String>) -> Self {
-        Self { kind: "image".into(), media_id: Some(media_id.into()), ..Default::default() }
+        Self {
+            kind: "image".into(),
+            media_id: Some(media_id.into()),
+            ..Default::default()
+        }
     }
     pub fn image_data(base64: impl Into<String>, media_type: impl Into<String>) -> Self {
         Self {
             kind: "image".into(),
-            data: Some(PartData { base64: base64.into(), media_type: media_type.into() }),
+            data: Some(PartData {
+                base64: base64.into(),
+                media_type: media_type.into(),
+            }),
             ..Default::default()
         }
     }

@@ -95,8 +95,15 @@ struct CompactionInfo {
 
 impl Conversation {
     /// Create (idempotently) a stored conversation.
-    pub async fn create(client: &Client, id: &str, opts: ConversationOptions) -> Result<Self, Error> {
-        let ns = opts.namespace.clone().unwrap_or_else(|| client.namespace.clone());
+    pub async fn create(
+        client: &Client,
+        id: &str,
+        opts: ConversationOptions,
+    ) -> Result<Self, Error> {
+        let ns = opts
+            .namespace
+            .clone()
+            .unwrap_or_else(|| client.namespace.clone());
         let mut body = json!({"id": id, "namespace": ns});
         if let Some(t) = &opts.title {
             body["title"] = json!(t);
@@ -146,7 +153,12 @@ impl Conversation {
         Ok(conv)
     }
 
-    async fn reload(&mut self, full: bool, branch: Option<&str>, at: Option<i64>) -> Result<(), Error> {
+    async fn reload(
+        &mut self,
+        full: bool,
+        branch: Option<&str>,
+        at: Option<i64>,
+    ) -> Result<(), Error> {
         let mut path = format!("/v1/conversations/{}", self.id);
         let mut q = Vec::new();
         if full {
@@ -161,7 +173,10 @@ impl Conversation {
         if !q.is_empty() {
             path = format!("{path}?{}", q.join("&"));
         }
-        let res: LoadResponse = self.client.request(reqwest::Method::GET, &path, None).await?;
+        let res: LoadResponse = self
+            .client
+            .request(reqwest::Method::GET, &path, None)
+            .await?;
         self.branch = res.branch;
         self.title = res.title;
         self.next_seq = res.next_seq;
@@ -196,13 +211,19 @@ impl Conversation {
         if self.opts.memory != MemoryMode::Query || user_message.trim().is_empty() {
             return Ok(None);
         }
-        self.client.context(user_message, self.opts.namespace.as_deref()).await
+        self.client
+            .context(user_message, self.opts.namespace.as_deref())
+            .await
     }
 
     /// Store messages, compacting first when the window or the exchange
     /// cadence demand it. `usage` is the provider response's usage — the real
     /// count, which beats the estimator.
-    pub async fn append(&mut self, batch: Vec<Message>, usage: Option<&Usage>) -> Result<(), Error> {
+    pub async fn append(
+        &mut self,
+        batch: Vec<Message>,
+        usage: Option<&Usage>,
+    ) -> Result<(), Error> {
         if batch.is_empty() {
             return Ok(());
         }

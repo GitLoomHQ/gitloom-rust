@@ -1,0 +1,53 @@
+name: Publish
+
+# crates.io versions are permanent: a release can be yanked but never replaced
+# or removed. So this runs from a GitHub Release rather than from main.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --check
+      - run: cargo test --all-features
+
+      - name: Tag matches Cargo.toml
+        if: github.event_name == 'release'
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          ver=$(cargo metadata --no-deps --format-version 1 | python3 -c "import json,sys;print(json.load(sys.stdin)['packages'][0]['version'])")
+          [ "${tag#v}" = "$ver" ] || {
+            echo "::error::release tag $tag does not match Cargo.toml version $ver"; exit 1; }
+
+      - name: Version is not already on crates.io
+        run: |
+          meta=$(cargo metadata --no-deps --format-version 1)
+          name=$(echo "$meta" | python3 -c "import json,sys;print(json.load(sys.stdin)['packages'][0]['name'])")
+          ver=$(echo "$meta" | python3 -c "import json,sys;print(json.load(sys.stdin)['packages'][0]['version'])")
+          if curl -fsS -A "gitloom-ci" "https://crates.io/api/v1/crates/$name/$ver" >/dev/null 2>&1; then
+            echo "::error::$name $ver is already on crates.io — bump the version"; exit 1
+          fi
+
+      # Packages exactly what would be uploaded and builds it in isolation, so
+      # a file missing from the crate fails here rather than for the first
+      # person to depend on it.
+      - run: cargo publish --dry-run --all-features
+
+      - run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

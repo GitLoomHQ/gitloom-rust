@@ -130,17 +130,48 @@ impl Usage {
     }
 }
 
-/// One retrieved memory with its evidence — the shape every GitLoom surface
-/// returns.
+/// One retrieved memory — the whole memory, not a fragment of one. A memory
+/// whose sections matched separately is still one entry, with the matching
+/// sections named.
 #[derive(Debug, Clone, Deserialize)]
-pub struct Hit {
+pub struct Memory {
     pub path: String,
-    pub score: f64,
-    pub snippet: String,
-    pub scores: Option<Scores>,
-    pub provenance: Option<Provenance>,
     #[serde(default)]
-    pub relations: Vec<Relation>,
+    pub tier: String,
+    pub topic: Option<String>,
+    pub title: Option<String>,
+    #[serde(default)]
+    pub content: String,
+    /// The query-focused excerpt, when the lexical arm matched.
+    pub snippet: Option<String>,
+
+    /// A calibrated relevance in `[0, 1]`, comparable *across* queries: a
+    /// memory that answers the question outright scores near 1 whatever else
+    /// the namespace holds. It replaced a fused rank that only meant
+    /// something within one response.
+    pub score: f64,
+    /// Which arms produced this memory: `lexical`, `cue`, `body`, `graph`.
+    /// Matched only by `graph` means context that rode in beside a real
+    /// match rather than evidence, and `via` names what pulled it in.
+    #[serde(default)]
+    pub matched: Vec<String>,
+    #[serde(default)]
+    pub sections: Vec<String>,
+    #[serde(default)]
+    pub via: Vec<String>,
+
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub created: Option<String>,
+    pub updated: Option<String>,
+    pub confidence: Option<f64>,
+    #[serde(default)]
+    pub cues: Vec<String>,
+
+    pub scores: Option<Scores>,
+    #[serde(default)]
+    pub related: Vec<Relation>,
+    pub provenance: Option<Provenance>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -149,8 +180,8 @@ pub struct Scores {
     pub cue: Option<f64>,
     pub body: Option<f64>,
     pub graph_hops: Option<i64>,
-    #[serde(default)]
-    pub arms: Vec<String>,
+    /// The fraction of the query's content terms the memory holds.
+    pub coverage: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -181,12 +212,129 @@ pub struct Relation {
     pub valid_to: Option<i64>,
 }
 
+/// A custom-vocabulary term the query matched.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VocabHit {
+    pub path: String,
+    pub term: String,
+    pub definition: Option<String>,
+    #[serde(default)]
+    pub matched: Vec<String>,
+}
+
+/// One step of an agentic retrieval's trace.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TraceEvent {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub tool: Option<String>,
+    pub id: Option<String>,
+    pub input: Option<serde_json::Value>,
+    pub result: Option<serde_json::Value>,
+    pub text: Option<String>,
+    pub millis: Option<i64>,
+}
+
+/// Where a retrieval spent its time. `model_ms` is set only when a mode ran
+/// one.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Timings {
+    #[serde(default)]
+    pub lexical_ms: i64,
+    #[serde(default)]
+    pub vector_ms: i64,
+    #[serde(default)]
+    pub graph_ms: i64,
+    pub model_ms: Option<i64>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct RecallResult {
     pub namespace: String,
     #[serde(default)]
-    pub hits: Vec<Hit>,
+    pub query: String,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub memories: Vec<Memory>,
+    #[serde(default)]
+    pub defined: Vec<VocabHit>,
+
+    /// Set by [`Mode::Summary`] and [`Mode::Agentic`]. `truncated` means the
+    /// agent hit its budget before choosing to stop.
+    pub answer: Option<String>,
+    pub model: Option<String>,
+    #[serde(default)]
+    pub trace: Vec<TraceEvent>,
+    #[serde(default)]
+    pub truncated: bool,
+
+    /// How many distinct memories any arm produced before the relevance
+    /// floor, and how many that floor dropped. Many filtered out with no
+    /// memories is an unanswerable question rather than a miss.
+    #[serde(default)]
+    pub candidates: i64,
+    #[serde(default)]
+    pub filtered_out: i64,
+    #[serde(default)]
     pub millis: i64,
+    #[serde(default)]
+    pub timings: Timings,
+}
+
+/// A vocabulary entry: a canonical form, the surface forms that mean the same
+/// thing, and what it means.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Term {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub term: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition: Option<String>,
+}
+
+/// Procedural know-how, stored as an ordinary memory under the skills tier.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Skill {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The procedure, as markdown; `##` headings become sections.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// How someone would ask for this skill. These become its retrieval cues,
+    /// so write them as the question rather than the topic. Empty falls back
+    /// to the name and description.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub triggers: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
+
+    /// Set on results, not on input.
+    #[serde(default, skip_serializing)]
+    pub score: f64,
+    #[serde(default, skip_serializing)]
+    pub matched: Vec<String>,
+}
+
+/// The acknowledgement every asynchronous write returns.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Accepted {
+    pub id: String,
+    pub namespace: String,
+    pub status: String,
+    #[serde(default)]
+    pub paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -202,4 +350,107 @@ pub struct BranchInfo {
     pub name: String,
     pub forked_from: Option<String>,
     pub forked_at: Option<i64>,
+}
+
+/// How a retrieval answers. `Raw` makes no model call beyond the query
+/// embedding and meters as a read; the other two run a model and meter as a
+/// chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    #[default]
+    Raw,
+    Summary,
+    Agentic,
+}
+
+impl Mode {
+    fn as_param(self) -> Option<&'static str> {
+        match self {
+            Mode::Raw => None,
+            Mode::Summary => Some("summary"),
+            Mode::Agentic => Some("agentic"),
+        }
+    }
+}
+
+/// Filters for a retrieval. Every one is applied *inside* each retrieval arm
+/// and to graph neighbours server-side.
+#[derive(Debug, Clone, Default)]
+pub struct RecallOptions {
+    pub namespace: Option<String>,
+    pub limit: Option<u32>,
+    pub mode: Mode,
+    /// `facts`, `incidents`, `rules`, `skills`.
+    pub tiers: Vec<String>,
+    /// Directories, e.g. `facts/events`.
+    pub paths: Vec<String>,
+    /// Any of these tags.
+    pub tags: Vec<String>,
+    /// Every one of these tags.
+    pub tags_all: Vec<String>,
+    /// `YYYY-MM-DD` or RFC 3339, over the memory's `updated`.
+    pub since: Option<String>,
+    pub until: Option<String>,
+    /// Drop memories scoring below this.
+    pub min_score: Option<f64>,
+    /// Drop graph neighbours, leaving only what matched the query directly.
+    pub no_context: bool,
+    /// `full` adds revision history, the last diff, relation snippets and cues.
+    pub detail: Option<String>,
+    pub include_expired: bool,
+}
+
+impl RecallOptions {
+    /// The parameters that differ from the defaults. Nothing is sent for a
+    /// field left unset, so a default request carries only `q` and
+    /// `namespace`.
+    pub(crate) fn query_pairs(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut push = |k: &str, v: String| out.push((k.to_string(), v));
+        if let Some(limit) = self.limit {
+            push("limit", limit.to_string());
+        }
+        if let Some(mode) = self.mode.as_param() {
+            push("mode", mode.to_string());
+        }
+        for (key, values) in [
+            ("tiers", &self.tiers),
+            ("paths", &self.paths),
+            ("tags", &self.tags),
+            ("tags_all", &self.tags_all),
+        ] {
+            if !values.is_empty() {
+                push(key, values.join(","));
+            }
+        }
+        if let Some(since) = &self.since {
+            push("since", since.clone());
+        }
+        if let Some(until) = &self.until {
+            push("until", until.clone());
+        }
+        if let Some(min) = self.min_score {
+            push("min_score", min.to_string());
+        }
+        if self.no_context {
+            push("context", "0".to_string());
+        }
+        if let Some(detail) = &self.detail {
+            push("detail", detail.clone());
+        }
+        if self.include_expired {
+            push("include_expired", "1".to_string());
+        }
+        out
+    }
+}
+
+/// Narrows a skill search.
+#[derive(Debug, Clone, Default)]
+pub struct SkillOptions {
+    pub namespace: Option<String>,
+    /// Topics under `skills/`, e.g. `ops`.
+    pub paths: Vec<String>,
+    pub tags: Vec<String>,
+    pub limit: Option<u32>,
 }

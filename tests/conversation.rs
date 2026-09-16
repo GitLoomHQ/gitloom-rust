@@ -210,7 +210,13 @@ async fn exchange_is_the_proxy() {
         .and(path("/v1/retrieve"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "namespace": "ns",
-            "hits": [{"path": "a.md", "score": 1.0, "snippet": "prefers Rust"}],
+            "memories": [{
+                "path": "facts/a.md",
+                "tier": "facts",
+                "content": "prefers Rust",
+                "score": 0.91,
+                "matched": ["lexical"]
+            }],
             "millis": 1
         })))
         .mount(&s)

@@ -2,7 +2,9 @@ use base64::Engine as _;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
-use crate::types::{MediaInfo, Message, RecallResult};
+use crate::types::{
+    Accepted, MediaInfo, Message, Mode, RecallOptions, RecallResult, Skill, SkillOptions, Term,
+};
 
 const DEFAULT_BASE_URL: &str = "https://api.gitloom.cloud";
 
@@ -20,6 +22,10 @@ pub enum Error {
     Transport(#[from] reqwest::Error),
     #[error("gitloom: {0}")]
     Usage(String),
+    /// A model-backed mode returned no text. An empty answer must not reach a
+    /// caller as an empty string they would show to a user.
+    #[error("gitloom: the model did not produce an answer")]
+    NoAnswer,
 }
 
 /// The GitLoom client. Writes are never retried: a retried write that
@@ -102,20 +108,64 @@ impl Client {
         Ok(())
     }
 
-    /// Retrieve what is known that bears on the query. Every hit carries its
-    /// evidence: per-arm scores, git history with the last diff, relations.
+    /// Retrieve what is known that bears on the query.
+    ///
+    /// Every entry is one whole memory. See [`recall_with`] to filter, and
+    /// [`answer`] to have a model write the answer instead.
+    ///
+    /// [`recall_with`]: Client::recall_with
+    /// [`answer`]: Client::answer
     pub async fn recall(
         &self,
         query: &str,
         namespace: Option<&str>,
     ) -> Result<RecallResult, Error> {
-        let ns = namespace.unwrap_or(&self.namespace);
-        let path = format!(
+        let opts = RecallOptions {
+            namespace: namespace.map(str::to_string),
+            ..Default::default()
+        };
+        self.recall_with(query, &opts).await
+    }
+
+    /// Retrieve with filters. Each one is applied *inside* every retrieval arm
+    /// and to graph neighbours server-side, so confining a query to a
+    /// directory is a boundary rather than a cut made after the fact.
+    pub async fn recall_with(
+        &self,
+        query: &str,
+        opts: &RecallOptions,
+    ) -> Result<RecallResult, Error> {
+        let ns = opts.namespace.as_deref().unwrap_or(&self.namespace);
+        let mut path = format!(
             "/v1/retrieve?q={}&namespace={}",
             urlencode(query),
             urlencode(ns)
         );
+        for (key, value) in opts.query_pairs() {
+            path.push('&');
+            path.push_str(&key);
+            path.push('=');
+            path.push_str(&urlencode(&value));
+        }
         self.request(reqwest::Method::GET, &path, None).await
+    }
+
+    /// One text answer drawn from the memory.
+    ///
+    /// A fast model summarizes one retrieval; with [`Mode::Agentic`] a
+    /// stronger model searches the memory itself with tools and returns its
+    /// trace. The memories the answer rests on come back on the result. Both
+    /// meter as chats rather than reads.
+    pub async fn answer(&self, query: &str, opts: &RecallOptions) -> Result<RecallResult, Error> {
+        let mut opts = opts.clone();
+        if opts.mode != Mode::Agentic {
+            opts.mode = Mode::Summary;
+        }
+        let res = self.recall_with(query, &opts).await?;
+        if res.answer.as_deref().unwrap_or("").trim().is_empty() {
+            return Err(Error::NoAnswer);
+        }
+        Ok(res)
     }
 
     /// Retrieval rendered as one system-message string; None when nothing
@@ -126,19 +176,136 @@ impl Client {
         namespace: Option<&str>,
     ) -> Result<Option<String>, Error> {
         let res = self.recall(query, namespace).await?;
-        if res.hits.is_empty() {
+        if res.memories.is_empty() {
             return Ok(None);
         }
         let mut s = String::from(
             "What you already know about this user, from earlier conversations. \
              Treat it as background, not as something they just said:\n",
         );
-        for h in &res.hits {
+        for m in &res.memories {
+            let text = if m.content.is_empty() {
+                m.snippet.as_deref().unwrap_or("")
+            } else {
+                &m.content
+            };
             s.push_str("- ");
-            s.push_str(&h.snippet);
+            s.push_str(text);
             s.push('\n');
         }
         Ok(Some(s))
+    }
+
+    /// Teach a namespace terms and their aliases. Once learned, a query for
+    /// any surface form also finds memories written with another.
+    /// Asynchronous, like every write.
+    pub async fn learn_terms(
+        &self,
+        terms: &[Term],
+        namespace: Option<&str>,
+    ) -> Result<Accepted, Error> {
+        let ns = namespace.unwrap_or(&self.namespace);
+        let body = serde_json::json!({ "namespace": ns, "terms": terms });
+        self.request(reqwest::Method::POST, "/v1/vocab", Some(body))
+            .await
+    }
+
+    /// The namespace's learned terms, alphabetically.
+    pub async fn vocabulary(
+        &self,
+        like: Option<&str>,
+        namespace: Option<&str>,
+    ) -> Result<Vec<Term>, Error> {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            terms: Vec<Term>,
+        }
+        let ns = namespace.unwrap_or(&self.namespace);
+        let mut path = format!("/v1/vocab?namespace={}", urlencode(ns));
+        if let Some(like) = like {
+            path.push_str(&format!("&like={}", urlencode(like)));
+        }
+        let w: Wrapper = self.request(reqwest::Method::GET, &path, None).await?;
+        Ok(w.terms)
+    }
+
+    /// Resolve any surface form to its term. `None` when the word is unknown,
+    /// which is not an error.
+    pub async fn lookup_term(
+        &self,
+        word: &str,
+        namespace: Option<&str>,
+    ) -> Result<Option<Term>, Error> {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            found: bool,
+            term: Option<Term>,
+        }
+        let ns = namespace.unwrap_or(&self.namespace);
+        let path = format!(
+            "/v1/vocab?namespace={}&word={}",
+            urlencode(ns),
+            urlencode(word)
+        );
+        let w: Wrapper = self.request(reqwest::Method::GET, &path, None).await?;
+        Ok(if w.found { w.term } else { None })
+    }
+
+    /// Forget terms by canonical form. One never learned is skipped rather
+    /// than failing the batch.
+    pub async fn forget_terms(
+        &self,
+        terms: &[&str],
+        namespace: Option<&str>,
+    ) -> Result<Accepted, Error> {
+        let ns = namespace.unwrap_or(&self.namespace);
+        let path = format!(
+            "/v1/vocab?namespace={}&term={}",
+            urlencode(ns),
+            urlencode(&terms.join(","))
+        );
+        self.request(reqwest::Method::DELETE, &path, None).await
+    }
+
+    /// Store skills. Each becomes a memory at `skills/<topic>/<slug>.md`; the
+    /// returned `paths` say where.
+    pub async fn store_skills(
+        &self,
+        skills: &[Skill],
+        namespace: Option<&str>,
+    ) -> Result<Accepted, Error> {
+        let ns = namespace.unwrap_or(&self.namespace);
+        let body = serde_json::json!({ "namespace": ns, "skills": skills });
+        self.request(reqwest::Method::POST, "/v1/skills", Some(body))
+            .await
+    }
+
+    /// The skills that bear on a task, best first. An empty task lists every
+    /// skill instead.
+    pub async fn find_skills(&self, task: &str, opts: &SkillOptions) -> Result<Vec<Skill>, Error> {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            skills: Vec<Skill>,
+        }
+        let ns = opts.namespace.as_deref().unwrap_or(&self.namespace);
+        let mut path = format!("/v1/skills?namespace={}", urlencode(ns));
+        if !task.is_empty() {
+            path.push_str(&format!("&q={}", urlencode(task)));
+        }
+        if !opts.paths.is_empty() {
+            path.push_str(&format!("&paths={}", urlencode(&opts.paths.join(","))));
+        }
+        if !opts.tags.is_empty() {
+            path.push_str(&format!("&tags={}", urlencode(&opts.tags.join(","))));
+        }
+        if let Some(limit) = opts.limit {
+            path.push_str(&format!("&limit={limit}"));
+        }
+        let w: Wrapper = self.request(reqwest::Method::GET, &path, None).await?;
+        Ok(w.skills)
     }
 
     /// Store one attachment (10MB cap; images, audio, PDF, text).

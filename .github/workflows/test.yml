@@ -31,3 +31,11 @@ jobs:
       # The default feature set is what `cargo add gitloom` gives you, and an
       # optional dependency leaking into it only shows up when built without.
       - run: cargo build --no-default-features
+
+      # docs/README.md is what GitBook Git-syncs into this SDK's documentation
+      # space. It is a copy, so a README change that skips it silently leaves
+      # the published docs describing an older API.
+      - name: GitBook copy matches the README
+        run: |
+          diff -u README.md docs/README.md \
+            || { echo "::error::run 'cp README.md docs/README.md' and commit it"; exit 1; }

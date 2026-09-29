@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- **`recall_with` and `answer` take `rank`, `max_chars` and `model`.** `rank`
+  (`Rank::Fused` or `Rank::Jev`) retrieves on the lane path, which also reaches
+  conversation turns and the dates in a question; `max_chars` caps the memory
+  content returned; `model` (`ReaderModel::Haiku` or `ReaderModel::Sonnet`)
+  picks the reader in `Mode::Summary` or `Mode::Agentic`. None is sent unless
+  set, so existing calls are unchanged.
+- **Lane-path fields.** `Memory` carries `store`, `said` and `excerpted`;
+  `RecallResult` carries `rank` and `rank_fallback`, and `Timings` the lane
+  path's `embed_ms`, `lanes_ms`, `rank_ms` and per-lane `lane`.
+
 ## 0.3.0 — 2026-09-16
 
 - **Recall returns memories.** `RecallResult::hits` becomes `memories`, and

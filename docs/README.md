@@ -101,6 +101,39 @@ last diff, labelled relation snippets and cues.
 `answer` meters as a chat rather than a read, and returns `Error::NoAnswer`
 rather than an empty string when the model finds nothing to say.
 
+### The lane path
+
+`rank` retrieves on the lane path: lexical, cue, body, graph and time lanes each
+search on their own, over the curated memories and the conversation turns, and
+the time lane reads dates in the question ("last month", "in May"). `Rank::Fused`
+orders what they find by lane score; `Rank::Jev` has a ranking model order it,
+and sets `rank_fallback` when it answers in lane order instead.
+
+```rust,ignore
+use gitloom::{Rank, ReaderModel, RecallOptions};
+
+let res = client.recall_with("when did I stake the tomatoes", &RecallOptions {
+    rank: Some(Rank::Fused),
+    max_chars: Some(8000),
+    ..Default::default()
+}).await?;
+for m in &res.memories {
+    println!("{:?} {:?} {} {}", m.store, m.said, m.excerpted, m.content);
+}
+
+let res = client.answer("what did I plant after the storm", &RecallOptions {
+    rank: Some(Rank::Jev),
+    model: Some(ReaderModel::Sonnet),
+    ..Default::default()
+}).await?;
+```
+
+Each memory then says which `store` it came from (`memory`, or a word-for-word
+conversation `turn`) and the days it was `said`. `max_chars` caps the memory
+content returned: a memory that does not fit is cut to its opening sentence and
+the sentences matching the question, and marked `excerpted`. `model` picks the
+model that reads the memories in `Mode::Summary` or `Mode::Agentic`.
+
 ## Vocabulary and skills
 
 ```rust,ignore

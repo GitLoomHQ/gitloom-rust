@@ -150,15 +150,26 @@ pub struct Memory {
     /// the namespace holds. It replaced a fused rank that only meant
     /// something within one response.
     pub score: f64,
-    /// Which arms produced this memory: `lexical`, `cue`, `body`, `graph`.
-    /// Matched only by `graph` means context that rode in beside a real
-    /// match rather than evidence, and `via` names what pulled it in.
+    /// Which arms produced this memory: `lexical`, `cue`, `body`, `graph`;
+    /// on the lane path, also `time`. Matched only by `graph` means context
+    /// that rode in beside a real match rather than evidence, and `via` names
+    /// what pulled it in.
     #[serde(default)]
     pub matched: Vec<String>,
     #[serde(default)]
     pub sections: Vec<String>,
     #[serde(default)]
     pub via: Vec<String>,
+
+    /// Lane path: a curated `memory`, or a conversation `turn` kept word for
+    /// word.
+    pub store: Option<String>,
+    /// Lane path: the days it was said, `YYYY-MM-DD`, oldest first.
+    #[serde(default)]
+    pub said: Vec<String>,
+    /// `content` was cut to fit `max_chars`.
+    #[serde(default)]
+    pub excerpted: bool,
 
     #[serde(default)]
     pub tags: Vec<String>,
@@ -246,6 +257,26 @@ pub struct Timings {
     #[serde(default)]
     pub graph_ms: i64,
     pub model_ms: Option<i64>,
+    /// Lane path: the query embedding, every lane, the ranking call, and each
+    /// lane on each store.
+    pub embed_ms: Option<i64>,
+    pub lanes_ms: Option<i64>,
+    pub rank_ms: Option<i64>,
+    #[serde(default)]
+    pub lane: Vec<LaneTiming>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LaneTiming {
+    #[serde(default)]
+    pub lane: String,
+    #[serde(default)]
+    pub store: String,
+    #[serde(default)]
+    pub ms: i64,
+    #[serde(default)]
+    pub n: i64,
+    pub err: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -268,6 +299,12 @@ pub struct RecallResult {
     pub trace: Vec<TraceEvent>,
     #[serde(default)]
     pub truncated: bool,
+
+    /// The lane ranking asked for. `rank_fallback` means `Rank::Jev` could
+    /// not rank, so the memories are in lane order.
+    pub rank: Option<String>,
+    #[serde(default)]
+    pub rank_fallback: bool,
 
     /// How many distinct memories any arm produced before the relevance
     /// floor, and how many that floor dropped. Many filtered out with no
@@ -373,6 +410,40 @@ impl Mode {
     }
 }
 
+/// How the lane path orders what it finds: by lane score, or with a ranking
+/// model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rank {
+    Fused,
+    Jev,
+}
+
+impl Rank {
+    fn as_param(self) -> &'static str {
+        match self {
+            Rank::Fused => "fused",
+            Rank::Jev => "jev",
+        }
+    }
+}
+
+/// A model that can read the memories in [`Mode::Summary`] or
+/// [`Mode::Agentic`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReaderModel {
+    Haiku,
+    Sonnet,
+}
+
+impl ReaderModel {
+    fn as_param(self) -> &'static str {
+        match self {
+            ReaderModel::Haiku => "haiku",
+            ReaderModel::Sonnet => "sonnet",
+        }
+    }
+}
+
 /// Filters for a retrieval. Every one is applied *inside* each retrieval arm
 /// and to graph neighbours server-side.
 #[derive(Debug, Clone, Default)]
@@ -398,6 +469,13 @@ pub struct RecallOptions {
     /// `full` adds revision history, the last diff, relation snippets and cues.
     pub detail: Option<String>,
     pub include_expired: bool,
+    /// Retrieve on the lane path, which also reaches conversation turns and
+    /// the dates in a question. Not with [`Mode::Agentic`].
+    pub rank: Option<Rank>,
+    /// The most characters of memory content to return; memories that do not
+    /// fit come back `excerpted`.
+    pub max_chars: Option<u32>,
+    pub model: Option<ReaderModel>,
 }
 
 impl RecallOptions {
@@ -440,6 +518,15 @@ impl RecallOptions {
         }
         if self.include_expired {
             push("include_expired", "1".to_string());
+        }
+        if let Some(rank) = self.rank {
+            push("rank", rank.as_param().to_string());
+        }
+        if let Some(max) = self.max_chars.filter(|&n| n > 0) {
+            push("max_chars", max.to_string());
+        }
+        if let Some(model) = self.model {
+            push("model", model.as_param().to_string());
         }
         out
     }

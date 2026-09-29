@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-use gitloom::{Client, Error, Mode, RecallOptions, Skill, SkillOptions, Term};
+use gitloom::{Client, Error, Mode, Rank, ReaderModel, RecallOptions, Skill, SkillOptions, Term};
 
 /// Every query string the fake saw, in order.
 type Seen = Arc<Mutex<Vec<HashMap<String, String>>>>;
@@ -161,6 +161,126 @@ async fn answer_refuses_to_return_nothing() {
         Err(Error::NoAnswer) => {}
         other => panic!("expected NoAnswer, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn recall_sends_the_lane_path_and_reads_what_it_adds() {
+    let (_s, client, seen) = retrieving(json!({
+        "namespace": "ns",
+        "query": "x",
+        "mode": "summary",
+        "rank": "jev",
+        "rank_fallback": true,
+        "memories": [{
+            "path": "turns/conv-1/main/000001-user-aa.md",
+            "tier": "facts",
+            "content": "user: I staked the tomatoes …",
+            "score": 0.8,
+            "matched": ["lexical", "time"],
+            "store": "turn",
+            "said": ["2026-05-21"],
+            "excerpted": true
+        }],
+        "candidates": 9,
+        "filtered_out": 0,
+        "millis": 40,
+        "timings": {
+            "lexical_ms": 0, "vector_ms": 0, "graph_ms": 0,
+            "embed_ms": 20, "lanes_ms": 8, "rank_ms": 300,
+            "lane": [{"lane": "time", "store": "turn", "ms": 2, "n": 1}]
+        }
+    }))
+    .await;
+
+    let res = client
+        .recall_with(
+            "x",
+            &RecallOptions {
+                mode: Mode::Summary,
+                rank: Some(Rank::Jev),
+                max_chars: Some(12000),
+                model: Some(ReaderModel::Sonnet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let q = &seen.lock().unwrap()[0];
+    assert_eq!(q["rank"], "jev");
+    assert_eq!(q["max_chars"], "12000");
+    assert_eq!(q["model"], "sonnet");
+
+    assert_eq!(res.rank.as_deref(), Some("jev"));
+    assert!(res.rank_fallback);
+    let m = &res.memories[0];
+    assert_eq!(m.store.as_deref(), Some("turn"));
+    assert_eq!(m.said, ["2026-05-21"]);
+    assert!(m.excerpted);
+    assert_eq!(m.matched, ["lexical", "time"]);
+    assert_eq!(res.timings.embed_ms, Some(20));
+    assert_eq!(res.timings.lanes_ms, Some(8));
+    assert_eq!(res.timings.rank_ms, Some(300));
+    let lane = &res.timings.lane[0];
+    assert_eq!((lane.lane.as_str(), lane.store.as_str()), ("time", "turn"));
+    assert_eq!((lane.ms, lane.n, lane.err.as_deref()), (2, 1, None));
+}
+
+#[tokio::test]
+async fn lane_path_stays_off_the_wire_unless_asked_for() {
+    let (_s, client, seen) = retrieving(one_memory()).await;
+    let res = client.recall("deploys", None).await.unwrap();
+    client
+        .recall_with(
+            "deploys",
+            &RecallOptions {
+                max_chars: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    for q in seen.lock().unwrap().iter() {
+        let mut sent: Vec<&str> = q.keys().map(String::as_str).collect();
+        sent.sort();
+        assert_eq!(sent, ["namespace", "q"]);
+    }
+
+    assert!(res.rank.is_none());
+    assert!(!res.rank_fallback);
+    let m = &res.memories[0];
+    assert!(m.store.is_none());
+    assert!(m.said.is_empty());
+    assert!(!m.excerpted);
+    assert!(res.timings.embed_ms.is_none());
+    assert!(res.timings.lane.is_empty());
+}
+
+#[tokio::test]
+async fn answer_passes_the_lane_path_through() {
+    let mut body = one_memory();
+    body["answer"] = json!("A.");
+    let (_s, client, seen) = retrieving(body).await;
+
+    client
+        .answer(
+            "x",
+            &RecallOptions {
+                rank: Some(Rank::Fused),
+                max_chars: Some(8000),
+                model: Some(ReaderModel::Haiku),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let q = &seen.lock().unwrap()[0];
+    assert_eq!(q["mode"], "summary");
+    assert_eq!(q["rank"], "fused");
+    assert_eq!(q["max_chars"], "8000");
+    assert_eq!(q["model"], "haiku");
 }
 
 #[tokio::test]

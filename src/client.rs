@@ -11,6 +11,7 @@ use crate::types::{
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.gitloom.cloud";
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A refusal or failure from the API.
 #[derive(Debug, thiserror::Error)]
@@ -51,7 +52,8 @@ impl Client {
     /// The key is trimmed, and an empty one falls back to `GITLOOM_API_KEY`.
     /// The constructor cannot fail, so a missing key (`missing_api_key`) or one
     /// holding whitespace or control characters (`invalid_api_key`) fails the
-    /// first call instead, before anything is sent.
+    /// first call instead, before anything is sent. Each request times out
+    /// after 60 seconds; see [`with_timeout`](Client::with_timeout).
     pub fn new(api_key: impl Into<String>) -> Self {
         let mut key = api_key.into().trim().to_string();
         if key.is_empty() {
@@ -65,14 +67,14 @@ impl Client {
             base_url: DEFAULT_BASE_URL.into(),
             api_key: key,
             namespace: "default".into(),
-            timeout: None,
+            timeout: Some(DEFAULT_TIMEOUT),
         }
     }
 
-    /// Bounds each request, start to finish. Unset, a request waits as long
-    /// as the server takes.
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = Some(timeout);
+    /// Bounds each request, start to finish; 60 seconds by default. `None`
+    /// waits as long as the server takes.
+    pub fn with_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.timeout = timeout.into();
         self
     }
 
@@ -130,7 +132,9 @@ impl Client {
             .headers()
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().parse().ok())
+            .map(str::trim)
+            .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|v| v.parse().ok())
             .map(Duration::from_secs)
             .filter(|_| status == 429);
         let raw = res.bytes().await?;
@@ -620,4 +624,19 @@ pub(crate) fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::Client;
+
+    #[test]
+    fn requests_time_out_after_a_minute_unless_told_otherwise() {
+        assert_eq!(Client::new("k").timeout, Some(Duration::from_secs(60)));
+        let short = Client::new("k").with_timeout(Duration::from_millis(5));
+        assert_eq!(short.timeout, Some(Duration::from_millis(5)));
+        assert_eq!(Client::new("k").with_timeout(None).timeout, None);
+    }
 }

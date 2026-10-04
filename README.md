@@ -322,9 +322,12 @@ trimmed, still holds whitespace or control characters.
 
 A 429's `retry_after` is its `Retry-After` in seconds, when it sent one.
 `Error::Transport` means no answer arrived: `is_timeout()` is true for a
-timeout (`Client::with_timeout` sets one) and the error reads "timed out"; any
-other failure reads "network error". No error's message, `Debug` form or cause
-contains the API key.
+timeout and the error reads "timed out"; any other failure reads "network
+error". No error's message, `Debug` form or cause contains the API key.
+
+Each request times out after 60 seconds.
+`Client::with_timeout(Duration::from_secs(120))` changes that, and
+`with_timeout(None)` waits as long as the server takes.
 
 ## Docs
 

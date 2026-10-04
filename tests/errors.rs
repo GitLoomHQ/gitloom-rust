@@ -205,10 +205,19 @@ async fn a_rate_limit_says_when_to_try_again() {
     assert_eq!(got, ("rate_limited".into(), Some(Duration::from_secs(30))));
     let got = retry_after(failure(limited()).await);
     assert_eq!(got, ("rate_limited".into(), None));
-    let got = retry_after(
-        failure(limited().insert_header("Retry-After", "Wed, 21 Oct 2026 07:28:00 GMT")).await,
-    );
-    assert_eq!(got.1, None);
+    // Delta-seconds is digits alone, as the other SDKs read it.
+    for header in [
+        "Wed, 21 Oct 2026 07:28:00 GMT",
+        "+30",
+        "-30",
+        "30.5",
+        "3e1",
+        "",
+        "99999999999999999999999",
+    ] {
+        let got = retry_after(failure(limited().insert_header("Retry-After", header)).await);
+        assert_eq!(got.1, None, "{header:?}");
+    }
     let got =
         retry_after(failure(ResponseTemplate::new(503).insert_header("Retry-After", "30")).await);
     assert_eq!(got, ("http_503".into(), None));
@@ -287,6 +296,31 @@ async fn a_slow_server_is_a_timeout() {
         other => panic!("expected a transport error, got {other:?}"),
     }
     assert!(err.to_string().starts_with("gitloom: timed out: "), "{err}");
+}
+
+#[tokio::test]
+async fn the_default_timeout_outlasts_a_short_stall() {
+    let s = answering(
+        ResponseTemplate::new(200)
+            .set_body_json(json!({"path": "facts/a.md"}))
+            .set_delay(Duration::from_millis(1500)),
+    )
+    .await;
+    let client = || Client::new(LEAK).with_base_url(s.uri());
+
+    let (default, unbounded, short) = tokio::join!(
+        async { client().get("facts/a.md", None).await },
+        async { client().with_timeout(None).get("facts/a.md", None).await },
+        async {
+            client()
+                .with_timeout(Duration::from_millis(200))
+                .get("facts/a.md", None)
+                .await
+        },
+    );
+    assert_eq!(default.unwrap().path, "facts/a.md");
+    assert_eq!(unbounded.unwrap().path, "facts/a.md");
+    assert!(matches!(short, Err(Error::Transport(e)) if e.is_timeout()));
 }
 
 #[tokio::test]

@@ -17,6 +17,10 @@
   field needs `..`.
 - **Breaking:** `RecallOptions::since` and `until` are `Option<Timestamp>`; a
   `String` value needs `.into()`.
+- **Breaking:** each request times out after 60 seconds, as in the Go and
+  Python SDKs; a stalled connection used to wait forever. The new
+  `Client::with_timeout` changes it, and `with_timeout(None)` waits as long as
+  the server takes.
 - **Direct memory primitives**, at parity with the Go SDK: `write` stores
   already-formed `NewMemory` values (refusing a path that does not end in `.md`
   before sending), `get` reads one by path, `forget` deletes by path, and
@@ -46,7 +50,7 @@
   reason. A 429's `Retry-After` in seconds is `retry_after`; nothing is
   retried for you. No error's message, `Debug` form or cause contains the key.
 - `Error::Transport` reads `gitloom: timed out: …` when `is_timeout()`, else
-  `gitloom: network error: …`. `Client::with_timeout` bounds each request.
+  `gitloom: network error: …`.
 - Memory times also read from RFC 3339, as a `time_format=iso` response
   carries them, and `tags` and `user_tags` read `null` as empty.
 - **`recall_with` and `answer` take `rank`, `max_chars` and `model`.** `rank`

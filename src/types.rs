@@ -450,15 +450,33 @@ pub struct StoredMemory {
     pub kind: Option<String>,
     #[serde(default)]
     pub content: String,
+    /// The caller's tags first, then the inferred ones.
     #[serde(default, deserialize_with = "nullable")]
     pub tags: Vec<String>,
+    /// The caller's tags alone.
+    #[serde(default, deserialize_with = "nullable")]
+    pub user_tags: Vec<String>,
     pub confidence: Option<f64>,
     #[serde(default, deserialize_with = "nullable")]
     pub cues: Vec<String>,
     #[serde(default, deserialize_with = "nullable")]
     pub related: Vec<String>,
+    #[deprecated(note = "use created_at")]
     pub created: Option<String>,
+    #[deprecated(note = "use updated_at")]
     pub updated: Option<String>,
+    #[serde(default, deserialize_with = "unix_seconds")]
+    pub created_at: Option<SystemTime>,
+    #[serde(default, deserialize_with = "unix_seconds")]
+    pub updated_at: Option<SystemTime>,
+    #[serde(default, deserialize_with = "unix_seconds")]
+    pub occurred_at: Option<SystemTime>,
+    #[serde(default, deserialize_with = "unix_seconds")]
+    pub expires_at: Option<SystemTime>,
+    /// How `occurred_at` is known: `user`, `extracted`, `said` or `written`.
+    pub occurred_source: Option<String>,
+    /// `instant`, or `day` when only the date is known.
+    pub occurred_precision: Option<String>,
 }
 
 /// Roots and bounds a table of contents.

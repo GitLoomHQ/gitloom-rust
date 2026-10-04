@@ -210,22 +210,50 @@ async fn remember_sends_only_the_conversation() {
 }
 
 #[tokio::test]
-async fn get_reads_by_path() {
+#[allow(deprecated)]
+async fn get_reads_tags_and_times() {
     let (s, client) = replying(
         "GET",
         "/v1/memories",
         json!({
-            "namespace": "ns",
-            "path": "facts/people/maya.md#commute",
-            "title": "Commute",
-            "tier": "facts",
-            "kind": "section",
-            "content": "Maya rides a bicycle.",
-            "tags": null,
-            "confidence": 0.8,
-            "created": "2026-07-19T09:30:00Z",
-            "updated": "2026-07-20T09:30:00Z",
-            "millis": 3
+            "confidence": 0, "content": "…", "created": "2026-10-04T13:33:23Z",
+            "created_at": 1791120803, "kind": "file", "millis": 0, "namespace": "x",
+            "occurred_at": 1772712000, "occurred_precision": "day", "occurred_source": "user",
+            "path": "facts/test/a.md", "tags": ["home", "lease"], "tier": "facts", "title": "",
+            "updated": "2026-10-04T13:33:23Z", "updated_at": 1791120803,
+            "user_tags": ["home", "lease"]
+        }),
+    )
+    .await;
+    let m = client.get("facts/test/a.md", Some("x")).await.unwrap();
+    let at = |s: u64| Some(UNIX_EPOCH + Duration::from_secs(s));
+    assert_eq!(m.path, "facts/test/a.md");
+    assert_eq!(m.kind.as_deref(), Some("file"));
+    assert_eq!(m.tags, ["home", "lease"]);
+    assert_eq!(m.user_tags, ["home", "lease"]);
+    assert_eq!(m.created_at, at(1791120803));
+    assert_eq!(m.updated_at, at(1791120803));
+    assert_eq!(m.occurred_at, at(1772712000));
+    assert!(m.expires_at.is_none());
+    assert_eq!(m.occurred_source.as_deref(), Some("user"));
+    assert_eq!(m.occurred_precision.as_deref(), Some("day"));
+    assert_eq!(m.created.as_deref(), Some("2026-10-04T13:33:23Z"));
+    assert_eq!(m.updated.as_deref(), Some("2026-10-04T13:33:23Z"));
+
+    let q = query(&only_request(&s).await);
+    assert_eq!(q["path"], "facts/test/a.md");
+    assert_eq!(q["namespace"], "x");
+}
+
+#[tokio::test]
+async fn get_reads_an_untagged_memory() {
+    let (s, client) = replying(
+        "GET",
+        "/v1/memories",
+        json!({
+            "namespace": "ns", "path": "facts/people/maya.md#commute", "kind": "section",
+            "content": "Maya rides a bicycle.", "tags": null, "user_tags": null,
+            "confidence": 0.8, "created_at": 1791120803, "updated_at": 1791120803
         }),
     )
     .await;
@@ -234,15 +262,13 @@ async fn get_reads_by_path() {
         .await
         .unwrap();
     assert_eq!(m.content, "Maya rides a bicycle.");
-    assert_eq!(m.kind.as_deref(), Some("section"));
     assert_eq!(m.confidence, Some(0.8));
-    assert!(m.tags.is_empty() && m.cues.is_empty() && m.related.is_empty());
-    assert_eq!(m.updated.as_deref(), Some("2026-07-20T09:30:00Z"));
+    assert!(m.tags.is_empty() && m.user_tags.is_empty());
+    assert!(m.cues.is_empty() && m.related.is_empty());
+    assert!(m.occurred_at.is_none() && m.occurred_source.is_none());
 
     let req = only_request(&s).await;
-    let q = query(&req);
-    assert_eq!(q["path"], "facts/people/maya.md#commute");
-    assert_eq!(q["namespace"], "ns");
+    assert_eq!(query(&req)["path"], "facts/people/maya.md#commute");
     assert!(req.url.query().unwrap().contains("%23commute"));
 }
 

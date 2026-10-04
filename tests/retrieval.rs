@@ -133,6 +133,7 @@ async fn recall_leaves_defaults_off_the_wire() {
         "until",
         "time_field",
         "tz",
+        "time_format",
     ] {
         assert!(!sent.contains(&key), "a default was sent: {key}");
     }
@@ -535,6 +536,34 @@ async fn memories_carry_their_tags_and_times() {
 }
 
 #[tokio::test]
+async fn times_read_as_rfc3339_and_null_tags_as_none() {
+    // What a time_format=iso response carries. The SDK never asks for it, but
+    // a response that has it must still read.
+    let (_s, client, _) = retrieving(json!({
+        "namespace": "ns",
+        "memories": [{
+            "path": "facts/test/a.md",
+            "content": "x",
+            "score": 1,
+            "tags": null,
+            "user_tags": null,
+            "created_at": "2026-10-04T19:03:23+05:30",
+            "updated_at": "2026-10-04T13:33:23Z",
+            "occurred_at": "2026-03-05T12:00:00Z",
+            "expires_at": "not a time"
+        }]
+    }))
+    .await;
+    let m = &client.recall("x", None).await.unwrap().memories[0];
+    let at = |s: u64| Some(UNIX_EPOCH + Duration::from_secs(s));
+    assert_eq!(m.created_at, at(1_791_120_803));
+    assert_eq!(m.updated_at, at(1_791_120_803));
+    assert_eq!(m.occurred_at, at(1_772_712_000));
+    assert!(m.expires_at.is_none());
+    assert!(m.tags.is_empty() && m.user_tags.is_empty());
+}
+
+#[tokio::test]
 async fn a_refused_filter_comes_back_with_its_code() {
     let s = MockServer::start().await;
     Mock::given(method("GET"))
@@ -561,6 +590,7 @@ async fn a_refused_filter_comes_back_with_its_code() {
             status,
             code,
             message,
+            ..
         } => {
             assert_eq!((status, code.as_str()), (400, "invalid_date"));
             assert_eq!(message, "since is after until");

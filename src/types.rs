@@ -174,10 +174,10 @@ pub struct Memory {
     pub excerpted: bool,
 
     /// The caller's tags first, then the inferred ones.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable")]
     pub tags: Vec<String>,
     /// The caller's tags alone.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable")]
     pub user_tags: Vec<String>,
     #[deprecated(note = "use created_at")]
     pub created: Option<String>,
@@ -785,15 +785,89 @@ impl TimeField {
     }
 }
 
+/// Unix seconds, or the RFC 3339 a `time_format=iso` response carries. A time
+/// that will not read is absent rather than a failed response.
 fn unix_seconds<'de, D: Deserializer<'de>>(d: D) -> Result<Option<SystemTime>, D::Error> {
-    Ok(Option::<i64>::deserialize(d)?.and_then(|s| {
-        let d = Duration::from_secs(s.unsigned_abs());
-        if s >= 0 {
-            UNIX_EPOCH.checked_add(d)
-        } else {
-            UNIX_EPOCH.checked_sub(d)
+    Ok(match Option::<Value>::deserialize(d)? {
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .or_else(|| n.as_f64().map(|f| f.floor() as i64))
+            .and_then(|s| from_unix(s, 0)),
+        Some(Value::String(s)) => parse_rfc3339(&s),
+        _ => None,
+    })
+}
+
+fn from_unix(secs: i64, nanos: u32) -> Option<SystemTime> {
+    let d = Duration::from_secs(secs.unsigned_abs());
+    let t = if secs >= 0 {
+        UNIX_EPOCH.checked_add(d)
+    } else {
+        UNIX_EPOCH.checked_sub(d)
+    };
+    t?.checked_add(Duration::from_nanos(nanos.into()))
+}
+
+fn parse_rfc3339(s: &str) -> Option<SystemTime> {
+    let b = s.trim().as_bytes();
+    let num = |r: std::ops::Range<usize>| -> Option<i64> {
+        let digits = b.get(r)?;
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+            return None;
         }
-    }))
+        std::str::from_utf8(digits).ok()?.parse().ok()
+    };
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || !matches!(b[10], b'T' | b't' | b' ')
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (h, mi, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+        return None;
+    }
+    let mut i = 19;
+    let mut nanos = 0u32;
+    if b[i] == b'.' {
+        let start = i + 1;
+        i = start;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        let frac = b.get(start..i).filter(|f| !f.is_empty())?;
+        for (k, c) in frac.iter().take(9).enumerate() {
+            nanos += u32::from(c - b'0') * 10u32.pow(8 - k as u32);
+        }
+    }
+    let offset = match b.get(i..)? {
+        [b'Z' | b'z'] => 0,
+        [sign @ (b'+' | b'-'), _, _, b':', _, _] => {
+            let o = num(i + 1..i + 3)? * 3600 + num(i + 4..i + 6)? * 60;
+            if *sign == b'-' {
+                -o
+            } else {
+                o
+            }
+        }
+        _ => return None,
+    };
+    let secs = days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + sec - offset;
+    from_unix(secs, nanos)
+}
+
+/// Howard Hinnant's days_from_civil, the inverse of [`civil_from_days`].
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// Filters for a retrieval. Every one is applied *inside* each retrieval arm
@@ -920,7 +994,46 @@ pub struct SkillOptions {
 
 #[cfg(test)]
 mod tests {
-    use super::{civil_from_days, rfc3339_utc};
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use super::{civil_from_days, days_from_civil, from_unix, parse_rfc3339, rfc3339_utc};
+
+    #[test]
+    fn civil_days_round_trip() {
+        for days in [-719_468, -1, 0, 11_016, 11_017, 20_000, 2_932_896] {
+            let (y, m, d) = civil_from_days(days);
+            assert_eq!(days_from_civil(y, m, d), days);
+        }
+    }
+
+    #[test]
+    fn rfc3339_reads_offsets_and_fractions() {
+        let at = |s: i64, n: u32| from_unix(s, n);
+        assert_eq!(parse_rfc3339("2026-10-04T13:33:23Z"), at(1_791_120_803, 0));
+        assert_eq!(
+            parse_rfc3339("2026-10-04T19:03:23+05:30"),
+            at(1_791_120_803, 0)
+        );
+        assert_eq!(
+            parse_rfc3339("2026-10-04T08:33:23.25-05:00"),
+            at(1_791_120_803, 250_000_000)
+        );
+        assert_eq!(
+            parse_rfc3339("1969-12-31T23:59:59Z"),
+            Some(UNIX_EPOCH - Duration::from_secs(1))
+        );
+        for bad in [
+            "",
+            "2026-10-04",
+            "2026-10-04T13:33:23",
+            "2026-13-04T13:33:23Z",
+            "2026-10-04T13:33:23+0530",
+            "2026-10-04T13:33:23.Z",
+            "yesterday at noon",
+        ] {
+            assert_eq!(parse_rfc3339(bad), None, "{bad}");
+        }
+    }
 
     #[test]
     fn civil_dates_round_the_leap_day() {

@@ -246,6 +246,25 @@ async fn get_reads_tags_and_times() {
 }
 
 #[tokio::test]
+async fn get_reads_rfc3339_times() {
+    let (_s, client) = replying(
+        "GET",
+        "/v1/memories",
+        json!({
+            "path": "facts/test/a.md", "content": "x", "tags": ["home"], "user_tags": ["home"],
+            "created_at": "2026-10-04T13:33:23Z", "occurred_at": "2026-03-05T17:30:00+05:30",
+            "expires_at": null
+        }),
+    )
+    .await;
+    let m = client.get("facts/test/a.md", None).await.unwrap();
+    let at = |s: u64| Some(UNIX_EPOCH + Duration::from_secs(s));
+    assert_eq!(m.created_at, at(1791120803));
+    assert_eq!(m.occurred_at, at(1772712000));
+    assert!(m.updated_at.is_none() && m.expires_at.is_none());
+}
+
+#[tokio::test]
 async fn get_reads_an_untagged_memory() {
     let (s, client) = replying(
         "GET",
@@ -482,6 +501,7 @@ async fn a_refused_tag_comes_back_with_its_code() {
             status,
             code,
             message,
+            ..
         } => {
             assert_eq!((status, code.as_str()), (400, "invalid_tag"));
             assert!(message.starts_with("memories[0].tags[0]"));

@@ -291,6 +291,41 @@ let skills = client.find_skills("release the new build", &Default::default()).aw
 Skills are memories under the `skills/` tier, so a recall with
 `tiers: vec!["skills".into()]` reaches them too.
 
+## Errors
+
+```rust,ignore
+use gitloom::Error;
+
+match client.recall("where do I live?", None).await {
+    Ok(res) => println!("{} memories", res.memories.len()),
+    Err(Error::Api { code, retry_after, .. }) if code == "rate_limited" => {
+        println!("rate limited; the server asks for {retry_after:?}");  // nothing retries for you
+    }
+    Err(Error::Api { status, code, message, .. }) => eprintln!("{status} {code}: {message}"),
+    Err(Error::Transport(e)) if e.is_timeout() => eprintln!("timed out: {e}"),
+    Err(Error::Transport(e)) => eprintln!("network error: {e}"),
+    Err(e) => eprintln!("{e}"),                                         // Usage, NoAnswer
+}
+```
+
+`Error::Api` carries the API's own `code` — `namespace_not_found`,
+`quota_exceeded`, `rate_limited`, `invalid_tag` and the like — and its
+`message`. Two codes come from the SDK instead: `unauthorized` when the gateway
+refused the key (401 or 403) before the API saw the request, and
+`http_<status>`, e.g. `http_502`, for any other answer without the API's
+envelope.
+
+`Client::new` cannot fail, so two more fire at the first request, with status 0
+and nothing sent: `missing_api_key` when no key was passed and
+`GITLOOM_API_KEY` is unset or blank, and `invalid_api_key` when the key, once
+trimmed, still holds whitespace or control characters.
+
+A 429's `retry_after` is its `Retry-After` in seconds, when it sent one.
+`Error::Transport` means no answer arrived: `is_timeout()` is true for a
+timeout (`Client::with_timeout` sets one) and the error reads "timed out"; any
+other failure reads "network error". No error's message, `Debug` form or cause
+contains the API key.
+
 ## Docs
 
 https://docs.gitloom.cloud/documentation/rust

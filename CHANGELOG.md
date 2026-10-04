@@ -2,6 +2,21 @@
 
 ## 0.4.0 — unreleased
 
+- **Breaking:** an error without the API's `{"error": {"code", "message"}}`
+  envelope is coded `http_<status>`, e.g. `http_502`; it was `http_error`.
+- **Breaking:** the gateway's own 401 and 403, which carry no envelope, are
+  coded `unauthorized`, with a message saying to check the API key.
+- **Breaking:** with no key — none passed and `GITLOOM_API_KEY` unset, or
+  either blank — every call returns `Error::Api` with status 0 and code
+  `missing_api_key` before any request, instead of sending an empty bearer
+  token.
+- **Breaking:** the key is trimmed when the client is built, and one that
+  still holds whitespace or control characters fails every call with status 0
+  and code `invalid_api_key` before any request.
+- **Breaking:** `Error::Api` gains `retry_after`, so a pattern naming every
+  field needs `..`.
+- **Breaking:** `RecallOptions::since` and `until` are `Option<Timestamp>`; a
+  `String` value needs `.into()`.
 - **Direct memory primitives**, at parity with the Go SDK: `write` stores
   already-formed `NewMemory` values (refusing a path that does not end in `.md`
   before sending), `get` reads one by path, `forget` deletes by path, and
@@ -24,17 +39,16 @@
   `user_tags`, `created_at`, `updated_at`, `occurred_at` and `expires_at` as
   `Option<SystemTime>`, `occurred_source` and `occurred_precision`. `created`
   and `updated` are deprecated.
-- **Error codes, the same in every GitLoom SDK.** An API refusal keeps the code
-  and message of its `{"error": {"code", "message"}}` envelope. The gateway's
-  own 401 and 403, which carry none, become `unauthorized` with a message
-  saying to check `GITLOOM_API_KEY`. Any other error without an envelope is
-  `http_<status>` (it was `http_error`), with the body's `message`, else its
-  text cut to 300 characters, else the status's reason; a bare
-  `{"error": "..."}` is no longer unpacked.
-- **No key fails before sending.** With no key passed and no
-  `GITLOOM_API_KEY`, every call returns `Error::Api` with status 0 and code
-  `missing_api_key` instead of sending an empty bearer token.
-- `Error::Transport` now reads `gitloom: network error: …`.
+- **Errors read the same in every GitLoom SDK.** An API refusal keeps its
+  envelope's code and message. Any other error's message is a flat
+  `{"error": "..."}`'s text, else the body's `message`, else its text cut to
+  300 characters; an empty or blank body, or a JSON `null`, reads the status's
+  reason. A 429's `Retry-After` in seconds is `retry_after`; nothing is
+  retried for you. No error's message, `Debug` form or cause contains the key.
+- `Error::Transport` reads `gitloom: timed out: …` when `is_timeout()`, else
+  `gitloom: network error: …`. `Client::with_timeout` bounds each request.
+- Memory times also read from RFC 3339, as a `time_format=iso` response
+  carries them, and `tags` and `user_tags` read `null` as empty.
 - **`recall_with` and `answer` take `rank`, `max_chars` and `model`.** `rank`
   (`Rank::Fused` or `Rank::Jev`) retrieves on the lane path, which also reaches
   conversation turns and the dates in a question; `max_chars` caps the memory

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use base64::Engine as _;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -13,16 +15,18 @@ const DEFAULT_BASE_URL: &str = "https://api.gitloom.cloud";
 /// A refusal or failure from the API.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The API refused, with its machine-readable code.
+    /// The API refused, with its machine-readable code. `retry_after` is a
+    /// 429's `Retry-After`, when it gave one in seconds.
     #[error("gitloom: {message} ({status} {code})")]
     Api {
         status: u16,
         code: String,
         message: String,
+        retry_after: Option<Duration>,
     },
     /// The request never got an answer: DNS, TLS, a refused connection, a
-    /// timeout, or a body cut off mid-read.
-    #[error("gitloom: network error: {0}")]
+    /// timeout (`is_timeout()`), or a body cut off mid-read.
+    #[error("gitloom: {}: {}", if .0.is_timeout() { "timed out" } else { "network error" }, .0)]
     Transport(#[from] reqwest::Error),
     #[error("gitloom: {0}")]
     Usage(String),
@@ -40,22 +44,36 @@ pub struct Client {
     pub(crate) base_url: String,
     pub(crate) api_key: String,
     pub(crate) namespace: String,
+    pub(crate) timeout: Option<Duration>,
 }
 
 impl Client {
-    /// An empty key falls back to `GITLOOM_API_KEY`. With neither, every call
-    /// fails with code `missing_api_key` before sending anything.
+    /// The key is trimmed, and an empty one falls back to `GITLOOM_API_KEY`.
+    /// The constructor cannot fail, so a missing key (`missing_api_key`) or one
+    /// holding whitespace or control characters (`invalid_api_key`) fails the
+    /// first call instead, before anything is sent.
     pub fn new(api_key: impl Into<String>) -> Self {
-        let mut key = api_key.into();
+        let mut key = api_key.into().trim().to_string();
         if key.is_empty() {
-            key = std::env::var("GITLOOM_API_KEY").unwrap_or_default();
+            key = std::env::var("GITLOOM_API_KEY")
+                .unwrap_or_default()
+                .trim()
+                .to_string();
         }
         Self {
             http: reqwest::Client::new(),
             base_url: DEFAULT_BASE_URL.into(),
             api_key: key,
             namespace: "default".into(),
+            timeout: None,
         }
+    }
+
+    /// Bounds each request, start to finish. Unset, a request waits as long
+    /// as the server takes.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
     }
 
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
@@ -74,11 +92,26 @@ impl Client {
         path: &str,
         body: Option<Value>,
     ) -> Result<T, Error> {
-        if self.api_key.is_empty() {
+        let refused = if self.api_key.is_empty() {
+            Some((
+                "missing_api_key",
+                "No API key. Pass it to the builder or set GITLOOM_API_KEY.",
+            ))
+        } else if !self.api_key.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+            Some((
+                "invalid_api_key",
+                "The API key contains whitespace or control characters — check \
+                 GITLOOM_API_KEY, or the key passed to the client.",
+            ))
+        } else {
+            None
+        };
+        if let Some((code, message)) = refused {
             return Err(Error::Api {
                 status: 0,
-                code: "missing_api_key".into(),
-                message: "No API key. Pass it to the builder or set GITLOOM_API_KEY.".into(),
+                code: code.into(),
+                message: message.into(),
+                retry_after: None,
             });
         }
         let mut req = self
@@ -88,16 +121,27 @@ impl Client {
         if let Some(b) = body {
             req = req.json(&b);
         }
+        if let Some(t) = self.timeout {
+            req = req.timeout(t);
+        }
         let res = req.send().await?;
         let status = res.status().as_u16();
+        let retry_after = res
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse().ok())
+            .map(Duration::from_secs)
+            .filter(|_| status == 429);
         let raw = res.bytes().await?;
         if status >= 400 {
-            return Err(error_from(status, &raw));
+            return Err(error_from(status, retry_after, &raw));
         }
         serde_json::from_slice(&raw).map_err(|e| Error::Api {
             status,
             code: "bad_response".into(),
             message: format!("undecodable JSON: {e}"),
+            retry_after: None,
         })
     }
 
@@ -504,13 +548,19 @@ impl Client {
 const MAX_MESSAGE: usize = 300;
 
 /// The API answers `{"error": {"code", "message"}}`. The gateway in front of
-/// it does not: a missing or bad key gets a bare `{"message": ...}`, and a
-/// proxy can answer with text, or with JSON that is not an object.
-fn error_from(status: u16, raw: &[u8]) -> Error {
+/// it does not: a missing or bad key gets a bare `{"message": ...}`, older
+/// routes a flat `{"error": "..."}`, and a proxy can answer with text, or with
+/// JSON that is not an object.
+fn error_from(status: u16, retry_after: Option<Duration>, raw: &[u8]) -> Error {
     let text = String::from_utf8_lossy(raw).trim().to_string();
     let body = match serde_json::from_str::<Value>(&text) {
         Ok(Value::Object(o)) => Some(o),
         _ => None,
+    };
+    let field = |v: Option<&Value>| {
+        v.and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
     };
     let reason = || {
         reqwest::StatusCode::from_u16(status)
@@ -518,43 +568,43 @@ fn error_from(status: u16, raw: &[u8]) -> Error {
             .and_then(|s| s.canonical_reason())
             .map_or_else(|| format!("Request failed with {status}"), str::to_string)
     };
-    let nonempty = |v: Option<&Value>| {
-        v.and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    };
     let api = |code: String, message: String| Error::Api {
         status,
         code,
         message,
+        retry_after,
     };
+    let error = body.as_ref().and_then(|o| o.get("error"));
 
-    if let Some(Value::Object(e)) = body.as_ref().and_then(|o| o.get("error")) {
+    if let Some(Value::Object(e)) = error {
         return api(
-            nonempty(e.get("code")).unwrap_or_else(|| format!("http_{status}")),
-            nonempty(e.get("message")).unwrap_or_else(reason),
+            field(e.get("code")).unwrap_or_else(|| format!("http_{status}")),
+            field(e.get("message")).unwrap_or_else(reason),
         );
     }
     let unauthorized = match status {
         403 => Some(
-            "The API key was not accepted (403 Forbidden) — check GITLOOM_API_KEY, \
-             or whether the key has been revoked.",
+            "The API key was not accepted (403 Forbidden) — check the API key \
+             (GITLOOM_API_KEY, or the key passed to the client), or whether it has been revoked.",
         ),
-        401 => Some("No API key was accepted (401 Unauthorized) — check GITLOOM_API_KEY."),
+        401 => Some(
+            "No API key was accepted (401 Unauthorized) — check the API key \
+             (GITLOOM_API_KEY, or the key passed to the client).",
+        ),
         _ => None,
     };
     if let Some(message) = unauthorized {
         return api("unauthorized".into(), message.into());
     }
-    let message = nonempty(body.as_ref().and_then(|o| o.get("message"))).unwrap_or_else(|| {
-        if text.is_empty() {
-            reason()
-        } else if text.chars().count() > MAX_MESSAGE {
-            text.chars().take(MAX_MESSAGE).chain(['…']).collect()
-        } else {
-            text
-        }
-    });
+    let message = field(error)
+        .or_else(|| field(body.as_ref().and_then(|o| o.get("message"))))
+        .unwrap_or_else(|| match text.as_str() {
+            "" | "null" => reason(),
+            t if t.chars().count() > MAX_MESSAGE => {
+                t.chars().take(MAX_MESSAGE).chain(['…']).collect()
+            }
+            t => t.to_string(),
+        });
     api(format!("http_{status}"), message)
 }
 

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0 — unreleased
+## 0.4.0 — 2026-10-04
 
 - **Breaking:** an error without the API's `{"error": {"code", "message"}}`
   envelope is coded `http_<status>`, e.g. `http_502`; it was `http_error`.

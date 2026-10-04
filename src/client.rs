@@ -20,7 +20,9 @@ pub enum Error {
         code: String,
         message: String,
     },
-    #[error("gitloom: transport: {0}")]
+    /// The request never got an answer: DNS, TLS, a refused connection, a
+    /// timeout, or a body cut off mid-read.
+    #[error("gitloom: network error: {0}")]
     Transport(#[from] reqwest::Error),
     #[error("gitloom: {0}")]
     Usage(String),
@@ -41,7 +43,8 @@ pub struct Client {
 }
 
 impl Client {
-    /// An empty key falls back to `GITLOOM_API_KEY`.
+    /// An empty key falls back to `GITLOOM_API_KEY`. With neither, every call
+    /// fails with code `missing_api_key` before sending anything.
     pub fn new(api_key: impl Into<String>) -> Self {
         let mut key = api_key.into();
         if key.is_empty() {
@@ -71,6 +74,13 @@ impl Client {
         path: &str,
         body: Option<Value>,
     ) -> Result<T, Error> {
+        if self.api_key.is_empty() {
+            return Err(Error::Api {
+                status: 0,
+                code: "missing_api_key".into(),
+                message: "No API key. Pass it to the builder or set GITLOOM_API_KEY.".into(),
+            });
+        }
         let mut req = self
             .http
             .request(method, format!("{}{}", self.base_url, path))
@@ -491,30 +501,61 @@ impl Client {
     }
 }
 
-/// Decodes both error shapes the API uses: the {code, message} envelope and
-/// the flat {"error": "..."} of the retrieval routes.
+const MAX_MESSAGE: usize = 300;
+
+/// The API answers `{"error": {"code", "message"}}`. The gateway in front of
+/// it does not: a missing or bad key gets a bare `{"message": ...}`, and a
+/// proxy can answer with text, or with JSON that is not an object.
 fn error_from(status: u16, raw: &[u8]) -> Error {
-    let mut code = "http_error".to_string();
-    let mut message = String::from_utf8_lossy(raw).trim().to_string();
-    if let Ok(v) = serde_json::from_slice::<Value>(raw) {
-        match v.get("error") {
-            Some(Value::String(s)) => message = s.clone(),
-            Some(Value::Object(o)) => {
-                if let Some(c) = o.get("code").and_then(Value::as_str) {
-                    code = c.into();
-                }
-                if let Some(m) = o.get("message").and_then(Value::as_str) {
-                    message = m.into();
-                }
-            }
-            _ => {}
-        }
-    }
-    Error::Api {
+    let text = String::from_utf8_lossy(raw).trim().to_string();
+    let body = match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Object(o)) => Some(o),
+        _ => None,
+    };
+    let reason = || {
+        reqwest::StatusCode::from_u16(status)
+            .ok()
+            .and_then(|s| s.canonical_reason())
+            .map_or_else(|| format!("Request failed with {status}"), str::to_string)
+    };
+    let nonempty = |v: Option<&Value>| {
+        v.and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let api = |code: String, message: String| Error::Api {
         status,
         code,
         message,
+    };
+
+    if let Some(Value::Object(e)) = body.as_ref().and_then(|o| o.get("error")) {
+        return api(
+            nonempty(e.get("code")).unwrap_or_else(|| format!("http_{status}")),
+            nonempty(e.get("message")).unwrap_or_else(reason),
+        );
     }
+    let unauthorized = match status {
+        403 => Some(
+            "The API key was not accepted (403 Forbidden) — check GITLOOM_API_KEY, \
+             or whether the key has been revoked.",
+        ),
+        401 => Some("No API key was accepted (401 Unauthorized) — check GITLOOM_API_KEY."),
+        _ => None,
+    };
+    if let Some(message) = unauthorized {
+        return api("unauthorized".into(), message.into());
+    }
+    let message = nonempty(body.as_ref().and_then(|o| o.get("message"))).unwrap_or_else(|| {
+        if text.is_empty() {
+            reason()
+        } else if text.chars().count() > MAX_MESSAGE {
+            text.chars().take(MAX_MESSAGE).chain(['…']).collect()
+        } else {
+            text
+        }
+    });
+    api(format!("http_{status}"), message)
 }
 
 pub(crate) fn urlencode(s: &str) -> String {

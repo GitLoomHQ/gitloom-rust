@@ -20,9 +20,21 @@
   `time_field` (`TimeField::Occurred`, `Created` or `Updated`) and `tz`, and
   `since` and `until` become a `Timestamp` — a `&str` still converts with
   `.into()`.
-- **Memory times.** `Memory` carries `user_tags`, `created_at`, `updated_at`,
-  `occurred_at` and `expires_at` as `Option<SystemTime>`, `occurred_source` and
-  `occurred_precision`. `created` and `updated` are deprecated.
+- **Memory times.** `Memory` and the `StoredMemory` that `get` returns carry
+  `user_tags`, `created_at`, `updated_at`, `occurred_at` and `expires_at` as
+  `Option<SystemTime>`, `occurred_source` and `occurred_precision`. `created`
+  and `updated` are deprecated.
+- **Error codes, the same in every GitLoom SDK.** An API refusal keeps the code
+  and message of its `{"error": {"code", "message"}}` envelope. The gateway's
+  own 401 and 403, which carry none, become `unauthorized` with a message
+  saying to check `GITLOOM_API_KEY`. Any other error without an envelope is
+  `http_<status>` (it was `http_error`), with the body's `message`, else its
+  text cut to 300 characters, else the status's reason; a bare
+  `{"error": "..."}` is no longer unpacked.
+- **No key fails before sending.** With no key passed and no
+  `GITLOOM_API_KEY`, every call returns `Error::Api` with status 0 and code
+  `missing_api_key` instead of sending an empty bearer token.
+- `Error::Transport` now reads `gitloom: network error: …`.
 - **`recall_with` and `answer` take `rank`, `max_chars` and `model`.** `rank`
   (`Rank::Fused` or `Rank::Jev`) retrieves on the lane path, which also reaches
   conversation turns and the dates in a question; `max_chars` caps the memory

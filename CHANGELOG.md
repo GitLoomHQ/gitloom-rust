@@ -1,7 +1,27 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 — unreleased
 
+- **Direct memory primitives**, at parity with the Go SDK: `write` stores
+  already-formed `NewMemory` values (refusing a path that does not end in `.md`
+  before sending), `get` reads one by path, `forget` deletes by path, and
+  `tree`, `topics` and `graph` navigate the table of contents, the topic
+  directories and the relationship graph.
+- **Tags and times on writes.** `remember_with` takes `RememberOptions`:
+  `tags` for every memory drawn from the conversation, `occurred_at`,
+  `timezone` and `session_id`. `NewMemory` takes `tags` and `occurred_at`.
+  `occurred_at` is a `Timestamp`, built from a `SystemTime` or an integer
+  (sent as epoch seconds) or a string (sent as-is). `date` still works and is
+  deprecated.
+- **Recall by filter alone.** An empty query lists every memory the filters
+  match, newest first; with neither a query nor a filter, `recall_with`
+  returns `Error::Usage` without calling the server. `RecallOptions` gains
+  `time_field` (`TimeField::Occurred`, `Created` or `Updated`) and `tz`, and
+  `since` and `until` become a `Timestamp` — a `&str` still converts with
+  `.into()`.
+- **Memory times.** `Memory` carries `user_tags`, `created_at`, `updated_at`,
+  `occurred_at` and `expires_at` as `Option<SystemTime>`, `occurred_source` and
+  `occurred_precision`. `created` and `updated` are deprecated.
 - **`recall_with` and `answer` take `rank`, `max_chars` and `model`.** `rank`
   (`Rank::Fused` or `Rank::Jev`) retrieves on the lane path, which also reaches
   conversation turns and the dates in a question; `max_chars` caps the memory

@@ -8,7 +8,42 @@ Provider-agnostic core; the `openai` feature adds conversions for
 
 ```toml
 [dependencies]
-gitloom = { version = "0.1", features = ["openai"] }
+gitloom = { version = "0.4", features = ["openai"] }
+tokio = { version = "1", features = ["full"] }
+```
+
+## Quickstart
+
+```rust,no_run
+use std::time::{Duration, SystemTime};
+
+use gitloom::{Client, NewMemory};
+
+#[tokio::main]
+async fn main() -> Result<(), gitloom::Error> {
+    let client = Client::new(""); // reads GITLOOM_API_KEY
+    client.create_namespace("default").await?;
+
+    client
+        .write(
+            &[NewMemory {
+                path: "facts/places/home.md".into(),
+                content: "I live in Pune.".into(),
+                tags: vec!["#home".into()],
+                occurred_at: Some(SystemTime::now().into()),
+                ..Default::default()
+            }],
+            None,
+        )
+        .await?;
+    tokio::time::sleep(Duration::from_secs(10)).await; // writes land within seconds
+
+    let res = client.recall("where do I live?", None).await?;
+    for m in &res.memories {
+        println!("{:.2} {} {}", m.score, m.path, m.content);
+    }
+    Ok(())
+}
 ```
 
 ## The loop
@@ -101,6 +136,131 @@ last diff, labelled relation snippets and cues.
 `answer` meters as a chat rather than a read, and returns `Error::NoAnswer`
 rather than an empty string when the model finds nothing to say.
 
+### The lane path
+
+`rank` retrieves on the lane path: lexical, cue, body, graph and time lanes each
+search on their own, over the curated memories and the conversation turns, and
+the time lane reads dates in the question ("last month", "in May"). `Rank::Fused`
+orders what they find by lane score; `Rank::Jev` has a ranking model order it,
+and sets `rank_fallback` when it answers in lane order instead.
+
+```rust,ignore
+use gitloom::{Rank, ReaderModel, RecallOptions};
+
+let res = client.recall_with("when did I stake the tomatoes", &RecallOptions {
+    rank: Some(Rank::Fused),
+    max_chars: Some(8000),
+    ..Default::default()
+}).await?;
+for m in &res.memories {
+    println!("{:?} {:?} {} {}", m.store, m.said, m.excerpted, m.content);
+}
+
+let res = client.answer("what did I plant after the storm", &RecallOptions {
+    rank: Some(Rank::Jev),
+    model: Some(ReaderModel::Sonnet),
+    ..Default::default()
+}).await?;
+```
+
+Each memory then says which `store` it came from (`memory`, or a word-for-word
+conversation `turn`) and the days it was `said`. `max_chars` caps the memory
+content returned: a memory that does not fit is cut to its opening sentence and
+the sentences matching the question, and marked `excerpted`. `model` picks the
+model that reads the memories in `Mode::Summary` or `Mode::Agentic`.
+
+## Tags and times
+
+```rust,ignore
+use std::time::SystemTime;
+use gitloom::{NewMemory, RememberOptions};
+
+// A conversation: the tags go on every memory drawn from it.
+client.remember_with(&turns, &RememberOptions {
+    tags: vec!["#launch".into(), "team:core".into()],
+    occurred_at: Some("2026-09-12T18:30:00".into()),   // when it happened,
+    timezone: Some("Asia/Kolkata".into()),             // read in this zone
+    ..Default::default()
+}).await?;
+
+// A memory already formed.
+client.write(&[NewMemory {
+    path: "incidents/ops/outage.md".into(),
+    content: "The API was down for 40 minutes.".into(),
+    tags: vec!["#outage".into()],
+    occurred_at: Some(SystemTime::now().into()),       // or 1_757_700_000.into(), or "2026-09-12".into()
+    ..Default::default()
+}], None).await?;
+```
+
+`occurred_at` is when the thing happened, not when it was written. It takes a
+`SystemTime` (sent as epoch seconds, or as RFC 3339 UTC before 1973-03-03,
+where the server would not read the number as one), an integer epoch, or a
+string sent as-is: RFC 3339 with an offset, a date `YYYY-MM-DD` meaning that
+calendar day, or a datetime without an offset, read in `timezone`. `date` still
+works and is deprecated.
+
+Tags are trimmed and lowercased: letters, digits, spaces and `- _ . : / # @`, at
+most 32 of 64 characters each. A refused one comes back as `Error::Api` with
+code `invalid_tag` and a message naming the field, e.g. `memories[1].tags[0]`.
+
+Every recalled memory carries `tags` (yours first), `user_tags` (yours alone),
+and `created_at`, `updated_at`, `occurred_at` and `expires_at` as
+`Option<SystemTime>`. `occurred_source` says how `occurred_at` is known (`user`,
+`extracted`, `said` or `written`), and `occurred_precision` is `day` when only
+the date is known (held as noon UTC on it) or `instant`. The `created` and
+`updated` strings are deprecated.
+
+## Recall by filter alone
+
+```rust,ignore
+use gitloom::{RecallOptions, TimeField};
+
+// No query: every memory tagged #launch that happened in September, newest first.
+let res = client.recall_with("", &RecallOptions {
+    tags: vec!["#launch".into()],
+    since: Some("2026-09-01".into()),
+    until: Some("2026-09-30".into()),          // a date-only until takes in that whole day
+    time_field: Some(TimeField::Occurred),     // Occurred | Created | Updated (the default)
+    tz: Some("Asia/Kolkata".into()),
+    ..Default::default()
+}).await?;
+```
+
+With an empty query, `recall_with` lists every memory the filters match, newest
+first by `time_field`, each scored 1. It needs at least one of `tags`,
+`tags_all`, `since`, `until`, `tiers` or `paths` — without one it returns
+`Error::Usage` before sending anything — and takes `Mode::Raw` with no `rank`.
+With a query, the same filters narrow the search. Values are URL-encoded for
+you, so a `#` in a tag arrives intact.
+
+## Memories by path
+
+```rust,ignore
+use gitloom::{NewMemory, TopicsOptions, TreeOptions};
+
+client.topics(&TopicsOptions { like: Some("databas".into()), ..Default::default() }).await?;
+client.write(&[NewMemory {
+    path: "facts/people/maya.md".into(),       // the directory is the topic
+    content: "Maya rides a bicycle to work.".into(),
+    cues: vec!["how does Maya get around".into()],
+    related: vec!["spouse: facts/people/sam.md".into()],
+    ..Default::default()
+}], None).await?;
+
+let m = client.get("facts/people/maya.md", None).await?;
+let toc = client.tree(&TreeOptions { path: Some("facts".into()), depth: Some(3), ..Default::default() }).await?;
+let graph = client.graph(&Default::default()).await?;
+client.forget(&["facts/people/maya.md"], None).await?;
+```
+
+`write` stores memories as given, where `remember` has a model decide what a
+conversation holds; send them in batches, since one call is one commit round.
+`get` reads a file or a `file.md#section`, `tree` is the table of contents,
+`topics` the directories with their memory counts — check it before inventing
+a topic — and `graph` the relationships between memories. `write` and `forget`
+are asynchronous, like `remember`.
+
 ## Vocabulary and skills
 
 ```rust,ignore
@@ -130,6 +290,44 @@ let skills = client.find_skills("release the new build", &Default::default()).aw
 
 Skills are memories under the `skills/` tier, so a recall with
 `tiers: vec!["skills".into()]` reaches them too.
+
+## Errors
+
+```rust,ignore
+use gitloom::Error;
+
+match client.recall("where do I live?", None).await {
+    Ok(res) => println!("{} memories", res.memories.len()),
+    Err(Error::Api { code, retry_after, .. }) if code == "rate_limited" => {
+        println!("rate limited; the server asks for {retry_after:?}");  // nothing retries for you
+    }
+    Err(Error::Api { status, code, message, .. }) => eprintln!("{status} {code}: {message}"),
+    Err(Error::Transport(e)) if e.is_timeout() => eprintln!("timed out: {e}"),
+    Err(Error::Transport(e)) => eprintln!("network error: {e}"),
+    Err(e) => eprintln!("{e}"),                                         // Usage, NoAnswer
+}
+```
+
+`Error::Api` carries the API's own `code` — `namespace_not_found`,
+`quota_exceeded`, `rate_limited`, `invalid_tag` and the like — and its
+`message`. Two codes come from the SDK instead: `unauthorized` when the gateway
+refused the key (401 or 403) before the API saw the request, and
+`http_<status>`, e.g. `http_502`, for any other answer without the API's
+envelope.
+
+`Client::new` cannot fail, so two more fire at the first request, with status 0
+and nothing sent: `missing_api_key` when no key was passed and
+`GITLOOM_API_KEY` is unset or blank, and `invalid_api_key` when the key, once
+trimmed, still holds whitespace or control characters.
+
+A 429's `retry_after` is its `Retry-After` in seconds, when it sent one.
+`Error::Transport` means no answer arrived: `is_timeout()` is true for a
+timeout and the error reads "timed out"; any other failure reads "network
+error". No error's message, `Debug` form or cause contains the API key.
+
+Each request times out after 60 seconds.
+`Client::with_timeout(Duration::from_secs(120))` changes that, and
+`with_timeout(None)` waits as long as the server takes.
 
 ## Docs
 

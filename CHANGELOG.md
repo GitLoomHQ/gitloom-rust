@@ -1,5 +1,68 @@
 # Changelog
 
+## 0.4.0 — 2026-10-04
+
+- **Breaking:** an error without the API's `{"error": {"code", "message"}}`
+  envelope is coded `http_<status>`, e.g. `http_502`; it was `http_error`.
+- **Breaking:** the gateway's own 401 and 403, which carry no envelope, are
+  coded `unauthorized`, with a message saying to check the API key.
+- **Breaking:** with no key — none passed and `GITLOOM_API_KEY` unset, or
+  either blank — every call returns `Error::Api` with status 0 and code
+  `missing_api_key` before any request, instead of sending an empty bearer
+  token.
+- **Breaking:** the key is trimmed when the client is built, and one that
+  still holds whitespace or control characters fails every call with status 0
+  and code `invalid_api_key` before any request.
+- **Breaking:** `Error::Api` gains `retry_after`, so a pattern naming every
+  field needs `..`.
+- **Breaking:** `RecallOptions::since` and `until` are `Option<Timestamp>`; a
+  `String` value needs `.into()`.
+- **Breaking:** each request times out after 60 seconds, as in the Go and
+  Python SDKs; a stalled connection used to wait forever. The new
+  `Client::with_timeout` changes it, and `with_timeout(None)` waits as long as
+  the server takes.
+- **Direct memory primitives**, at parity with the Go SDK: `write` stores
+  already-formed `NewMemory` values (refusing a path that does not end in `.md`
+  before sending), `get` reads one by path, `forget` deletes by path, and
+  `tree`, `topics` and `graph` navigate the table of contents, the topic
+  directories and the relationship graph.
+- **Tags and times on writes.** `remember_with` takes `RememberOptions`:
+  `tags` for every memory drawn from the conversation, `occurred_at`,
+  `timezone` and `session_id`. `NewMemory` takes `tags` and `occurred_at`.
+  `occurred_at` is a `Timestamp`, built from a `SystemTime` (epoch seconds,
+  or RFC 3339 UTC outside the 9-to-11-digit range the server reads as epoch
+  seconds), an integer (sent as given) or a string (sent as-is). `date` still
+  works and is deprecated.
+- **Recall by filter alone.** An empty query lists every memory the filters
+  match, newest first; with neither a query nor a filter, `recall_with`
+  returns `Error::Usage` without calling the server. `RecallOptions` gains
+  `time_field` (`TimeField::Occurred`, `Created` or `Updated`) and `tz`, and
+  `since` and `until` become a `Timestamp` — a `&str` still converts with
+  `.into()`.
+- **Memory times.** `Memory` and the `StoredMemory` that `get` returns carry
+  `user_tags`, `created_at`, `updated_at`, `occurred_at` and `expires_at` as
+  `Option<SystemTime>`, `occurred_source` and `occurred_precision`. `created`
+  and `updated` are deprecated.
+- **Errors read the same in every GitLoom SDK.** An API refusal keeps its
+  envelope's code and message. Any other error's message is a flat
+  `{"error": "..."}`'s text, else the body's `message`, else its text cut to
+  300 characters; an empty or blank body, or a JSON `null`, reads the status's
+  reason. A 429's `Retry-After` in seconds is `retry_after`; nothing is
+  retried for you. No error's message, `Debug` form or cause contains the key.
+- `Error::Transport` reads `gitloom: timed out: …` when `is_timeout()`, else
+  `gitloom: network error: …`.
+- Memory times also read from RFC 3339, as a `time_format=iso` response
+  carries them, and `tags` and `user_tags` read `null` as empty.
+- **`recall_with` and `answer` take `rank`, `max_chars` and `model`.** `rank`
+  (`Rank::Fused` or `Rank::Jev`) retrieves on the lane path, which also reaches
+  conversation turns and the dates in a question; `max_chars` caps the memory
+  content returned; `model` (`ReaderModel::Haiku` or `ReaderModel::Sonnet`)
+  picks the reader in `Mode::Summary` or `Mode::Agentic`. None is sent unless
+  set, so existing calls are unchanged.
+- **Lane-path fields.** `Memory` carries `store`, `said` and `excerpted`;
+  `RecallResult` carries `rank` and `rank_fallback`, and `Timings` the lane
+  path's `embed_ms`, `lanes_ms`, `rank_ms` and per-lane `lane`.
+
 ## 0.3.0 — 2026-09-16
 
 - **Recall returns memories.** `RecallResult::hits` becomes `memories`, and

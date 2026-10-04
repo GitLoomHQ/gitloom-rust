@@ -1,24 +1,33 @@
+use std::time::Duration;
+
 use base64::Engine as _;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
 use crate::types::{
-    Accepted, MediaInfo, Message, Mode, RecallOptions, RecallResult, Skill, SkillOptions, Term,
+    Accepted, GraphOptions, GraphResult, MediaInfo, Message, Mode, NewMemory, RecallOptions,
+    RecallResult, RememberOptions, Skill, SkillOptions, StoredMemory, Term, TopicsOptions,
+    TopicsResult, TreeOptions, TreeResult,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.gitloom.cloud";
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A refusal or failure from the API.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The API refused, with its machine-readable code.
+    /// The API refused, with its machine-readable code. `retry_after` is a
+    /// 429's `Retry-After`, when it gave one in seconds.
     #[error("gitloom: {message} ({status} {code})")]
     Api {
         status: u16,
         code: String,
         message: String,
+        retry_after: Option<Duration>,
     },
-    #[error("gitloom: transport: {0}")]
+    /// The request never got an answer: DNS, TLS, a refused connection, a
+    /// timeout (`is_timeout()`), or a body cut off mid-read.
+    #[error("gitloom: {}: {}", if .0.is_timeout() { "timed out" } else { "network error" }, .0)]
     Transport(#[from] reqwest::Error),
     #[error("gitloom: {0}")]
     Usage(String),
@@ -36,21 +45,37 @@ pub struct Client {
     pub(crate) base_url: String,
     pub(crate) api_key: String,
     pub(crate) namespace: String,
+    pub(crate) timeout: Option<Duration>,
 }
 
 impl Client {
-    /// An empty key falls back to `GITLOOM_API_KEY`.
+    /// The key is trimmed, and an empty one falls back to `GITLOOM_API_KEY`.
+    /// The constructor cannot fail, so a missing key (`missing_api_key`) or one
+    /// holding whitespace or control characters (`invalid_api_key`) fails the
+    /// first call instead, before anything is sent. Each request times out
+    /// after 60 seconds; see [`with_timeout`](Client::with_timeout).
     pub fn new(api_key: impl Into<String>) -> Self {
-        let mut key = api_key.into();
+        let mut key = api_key.into().trim().to_string();
         if key.is_empty() {
-            key = std::env::var("GITLOOM_API_KEY").unwrap_or_default();
+            key = std::env::var("GITLOOM_API_KEY")
+                .unwrap_or_default()
+                .trim()
+                .to_string();
         }
         Self {
             http: reqwest::Client::new(),
             base_url: DEFAULT_BASE_URL.into(),
             api_key: key,
             namespace: "default".into(),
+            timeout: Some(DEFAULT_TIMEOUT),
         }
+    }
+
+    /// Bounds each request, start to finish; 60 seconds by default. `None`
+    /// waits as long as the server takes.
+    pub fn with_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.timeout = timeout.into();
+        self
     }
 
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
@@ -69,6 +94,28 @@ impl Client {
         path: &str,
         body: Option<Value>,
     ) -> Result<T, Error> {
+        let refused = if self.api_key.is_empty() {
+            Some((
+                "missing_api_key",
+                "No API key. Pass it to the builder or set GITLOOM_API_KEY.",
+            ))
+        } else if !self.api_key.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+            Some((
+                "invalid_api_key",
+                "The API key contains whitespace or control characters — check \
+                 GITLOOM_API_KEY, or the key passed to the client.",
+            ))
+        } else {
+            None
+        };
+        if let Some((code, message)) = refused {
+            return Err(Error::Api {
+                status: 0,
+                code: code.into(),
+                message: message.into(),
+                retry_after: None,
+            });
+        }
         let mut req = self
             .http
             .request(method, format!("{}{}", self.base_url, path))
@@ -76,36 +123,186 @@ impl Client {
         if let Some(b) = body {
             req = req.json(&b);
         }
+        if let Some(t) = self.timeout {
+            req = req.timeout(t);
+        }
         let res = req.send().await?;
         let status = res.status().as_u16();
+        let retry_after = res
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|v| v.parse().ok())
+            .map(Duration::from_secs)
+            .filter(|_| status == 429);
         let raw = res.bytes().await?;
         if status >= 400 {
-            return Err(error_from(status, &raw));
+            return Err(error_from(status, retry_after, &raw));
         }
         serde_json::from_slice(&raw).map_err(|e| Error::Api {
             status,
             code: "bad_response".into(),
             message: format!("undecodable JSON: {e}"),
+            retry_after: None,
         })
     }
 
     /// Submit a conversation for ingestion. Asynchronous by design.
     pub async fn remember(&self, turns: &[Message], namespace: Option<&str>) -> Result<(), Error> {
+        let opts = RememberOptions {
+            namespace: namespace.map(str::to_string),
+            ..Default::default()
+        };
+        self.remember_with(turns, &opts).await
+    }
+
+    /// [`remember`](Client::remember), with tags for every memory drawn from
+    /// the conversation and the time it happened.
+    pub async fn remember_with(
+        &self,
+        turns: &[Message],
+        opts: &RememberOptions,
+    ) -> Result<(), Error> {
         let turns: Vec<Value> = turns
             .iter()
             .map(|m| json!({"role": m.role, "content": m.text()}))
             .collect();
+        let mut body = json!({
+            "namespace": opts.namespace.as_deref().unwrap_or(&self.namespace),
+            "messages": turns,
+        });
+        if let Some(id) = &opts.session_id {
+            body["session_id"] = json!(id);
+        }
+        if !opts.tags.is_empty() {
+            body["tags"] = json!(opts.tags);
+        }
+        if let Some(at) = &opts.occurred_at {
+            body["occurred_at"] = json!(at);
+        }
+        if let Some(tz) = &opts.timezone {
+            body["timezone"] = json!(tz);
+        }
+        #[allow(deprecated)]
+        if let Some(date) = &opts.date {
+            body["date"] = json!(date);
+        }
         let _: Value = self
-            .request(
-                reqwest::Method::POST,
-                "/v1/memories",
-                Some(json!({
-                    "namespace": namespace.unwrap_or(&self.namespace),
-                    "messages": turns,
-                })),
-            )
+            .request(reqwest::Method::POST, "/v1/memories", Some(body))
             .await?;
         Ok(())
+    }
+
+    /// Store already-formed memories, where [`remember`](Client::remember)
+    /// has a model decide what a conversation holds. Asynchronous: the
+    /// memories appear in retrieval within seconds. Send them in batches —
+    /// one call is one commit round.
+    pub async fn write(
+        &self,
+        memories: &[NewMemory],
+        namespace: Option<&str>,
+    ) -> Result<(), Error> {
+        if memories.is_empty() {
+            return Ok(());
+        }
+        for (i, m) in memories.iter().enumerate() {
+            if !m.path.ends_with(".md") {
+                return Err(Error::Usage(format!(
+                    "memory {i}: path {:?} must end in .md",
+                    m.path
+                )));
+            }
+        }
+        let body = json!({
+            "namespace": namespace.unwrap_or(&self.namespace),
+            "memories": memories,
+        });
+        let _: Value = self
+            .request(reqwest::Method::POST, "/v1/memories", Some(body))
+            .await?;
+        Ok(())
+    }
+
+    /// Read one memory by path — a file, or `file.md#section`. This is what
+    /// follows a recall: it returns paths, and this reads what they name.
+    pub async fn get(&self, path: &str, namespace: Option<&str>) -> Result<StoredMemory, Error> {
+        let ns = namespace.unwrap_or(&self.namespace);
+        let path = format!(
+            "/v1/memories?path={}&namespace={}",
+            urlencode(path),
+            urlencode(ns)
+        );
+        self.request(reqwest::Method::GET, &path, None).await
+    }
+
+    /// Delete memories by path. Asynchronous, like every write. They leave
+    /// retrieval; earlier revisions stay in the repository's history.
+    pub async fn forget(&self, paths: &[&str], namespace: Option<&str>) -> Result<(), Error> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let ns = namespace.unwrap_or(&self.namespace);
+        let path = format!(
+            "/v1/memories?path={}&namespace={}",
+            urlencode(&paths.join(",")),
+            urlencode(ns)
+        );
+        let _: Value = self.request(reqwest::Method::DELETE, &path, None).await?;
+        Ok(())
+    }
+
+    /// The table of contents: tier, topic, file, sections, each with a
+    /// summary — what a navigator descends instead of guessing at the words a
+    /// search would need.
+    pub async fn tree(&self, opts: &TreeOptions) -> Result<TreeResult, Error> {
+        let ns = opts.namespace.as_deref().unwrap_or(&self.namespace);
+        let mut path = format!("/v1/tree?namespace={}", urlencode(ns));
+        if let Some(root) = opts.path.as_deref().filter(|p| !p.is_empty()) {
+            path.push_str(&format!("&path={}", urlencode(root)));
+        }
+        if let Some(depth) = opts.depth.filter(|&d| d > 0) {
+            path.push_str(&format!("&depth={depth}"));
+        }
+        self.request(reqwest::Method::GET, &path, None).await
+    }
+
+    /// The topics, with how many memories each holds. Check here before
+    /// filing under a new topic, or `facts/databases` ends up beside
+    /// `facts/database`.
+    pub async fn topics(&self, opts: &TopicsOptions) -> Result<TopicsResult, Error> {
+        let ns = opts.namespace.as_deref().unwrap_or(&self.namespace);
+        let mut path = format!("/v1/topics?namespace={}", urlencode(ns));
+        for (key, value) in [
+            ("tier", &opts.tier),
+            ("prefix", &opts.prefix),
+            ("like", &opts.like),
+        ] {
+            if let Some(v) = value.as_deref().filter(|v| !v.is_empty()) {
+                path.push_str(&format!("&{key}={}", urlencode(v)));
+            }
+        }
+        for (key, value) in [
+            ("max_depth", opts.max_depth),
+            ("min_files", opts.min_files),
+            ("limit", opts.limit),
+        ] {
+            if let Some(n) = value.filter(|&n| n > 0) {
+                path.push_str(&format!("&{key}={n}"));
+            }
+        }
+        self.request(reqwest::Method::GET, &path, None).await
+    }
+
+    /// The relationship graph between memories.
+    pub async fn graph(&self, opts: &GraphOptions) -> Result<GraphResult, Error> {
+        let ns = opts.namespace.as_deref().unwrap_or(&self.namespace);
+        let mut path = format!("/v1/graph?namespace={}", urlencode(ns));
+        if let Some(limit) = opts.limit.filter(|&n| n > 0) {
+            path.push_str(&format!("&limit={limit}"));
+        }
+        self.request(reqwest::Method::GET, &path, None).await
     }
 
     /// Retrieve what is known that bears on the query.
@@ -130,17 +327,29 @@ impl Client {
     /// Retrieve with filters. Each one is applied *inside* every retrieval arm
     /// and to graph neighbours server-side, so confining a query to a
     /// directory is a boundary rather than a cut made after the fact.
+    ///
+    /// An empty query lists every memory the filters match instead, newest
+    /// first by `time_field`, each scored 1. That takes [`Mode::Raw`] and no
+    /// `rank`, and at least one of `tags`, `tags_all`, `since`, `until`,
+    /// `tiers` or `paths`.
     pub async fn recall_with(
         &self,
         query: &str,
         opts: &RecallOptions,
     ) -> Result<RecallResult, Error> {
+        let listing = query.trim().is_empty();
+        if listing && !opts.has_filter() {
+            return Err(Error::Usage(
+                "recall needs a query, or a filter (tags, tags_all, since, until, tiers or paths) \
+                 that says what to list"
+                    .into(),
+            ));
+        }
         let ns = opts.namespace.as_deref().unwrap_or(&self.namespace);
-        let mut path = format!(
-            "/v1/retrieve?q={}&namespace={}",
-            urlencode(query),
-            urlencode(ns)
-        );
+        let mut path = format!("/v1/retrieve?namespace={}", urlencode(ns));
+        if !listing {
+            path.push_str(&format!("&q={}", urlencode(query)));
+        }
         for (key, value) in opts.query_pairs() {
             path.push('&');
             path.push_str(&key);
@@ -340,30 +549,67 @@ impl Client {
     }
 }
 
-/// Decodes both error shapes the API uses: the {code, message} envelope and
-/// the flat {"error": "..."} of the retrieval routes.
-fn error_from(status: u16, raw: &[u8]) -> Error {
-    let mut code = "http_error".to_string();
-    let mut message = String::from_utf8_lossy(raw).trim().to_string();
-    if let Ok(v) = serde_json::from_slice::<Value>(raw) {
-        match v.get("error") {
-            Some(Value::String(s)) => message = s.clone(),
-            Some(Value::Object(o)) => {
-                if let Some(c) = o.get("code").and_then(Value::as_str) {
-                    code = c.into();
-                }
-                if let Some(m) = o.get("message").and_then(Value::as_str) {
-                    message = m.into();
-                }
-            }
-            _ => {}
-        }
-    }
-    Error::Api {
+const MAX_MESSAGE: usize = 300;
+
+/// The API answers `{"error": {"code", "message"}}`. The gateway in front of
+/// it does not: a missing or bad key gets a bare `{"message": ...}`, older
+/// routes a flat `{"error": "..."}`, and a proxy can answer with text, or with
+/// JSON that is not an object.
+fn error_from(status: u16, retry_after: Option<Duration>, raw: &[u8]) -> Error {
+    let text = String::from_utf8_lossy(raw).trim().to_string();
+    let body = match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Object(o)) => Some(o),
+        _ => None,
+    };
+    let field = |v: Option<&Value>| {
+        v.and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let reason = || {
+        reqwest::StatusCode::from_u16(status)
+            .ok()
+            .and_then(|s| s.canonical_reason())
+            .map_or_else(|| format!("Request failed with {status}"), str::to_string)
+    };
+    let api = |code: String, message: String| Error::Api {
         status,
         code,
         message,
+        retry_after,
+    };
+    let error = body.as_ref().and_then(|o| o.get("error"));
+
+    if let Some(Value::Object(e)) = error {
+        return api(
+            field(e.get("code")).unwrap_or_else(|| format!("http_{status}")),
+            field(e.get("message")).unwrap_or_else(reason),
+        );
     }
+    let unauthorized = match status {
+        403 => Some(
+            "The API key was not accepted (403 Forbidden) — check the API key \
+             (GITLOOM_API_KEY, or the key passed to the client), or whether it has been revoked.",
+        ),
+        401 => Some(
+            "No API key was accepted (401 Unauthorized) — check the API key \
+             (GITLOOM_API_KEY, or the key passed to the client).",
+        ),
+        _ => None,
+    };
+    if let Some(message) = unauthorized {
+        return api("unauthorized".into(), message.into());
+    }
+    let message = field(error)
+        .or_else(|| field(body.as_ref().and_then(|o| o.get("message"))))
+        .unwrap_or_else(|| match text.as_str() {
+            "" | "null" => reason(),
+            t if t.chars().count() > MAX_MESSAGE => {
+                t.chars().take(MAX_MESSAGE).chain(['…']).collect()
+            }
+            t => t.to_string(),
+        });
+    api(format!("http_{status}"), message)
 }
 
 pub(crate) fn urlencode(s: &str) -> String {
@@ -378,4 +624,19 @@ pub(crate) fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::Client;
+
+    #[test]
+    fn requests_time_out_after_a_minute_unless_told_otherwise() {
+        assert_eq!(Client::new("k").timeout, Some(Duration::from_secs(60)));
+        let short = Client::new("k").with_timeout(Duration::from_millis(5));
+        assert_eq!(short.timeout, Some(Duration::from_millis(5)));
+        assert_eq!(Client::new("k").with_timeout(None).timeout, None);
+    }
 }

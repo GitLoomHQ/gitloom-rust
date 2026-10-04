@@ -10,9 +10,10 @@
 - **Tags and times on writes.** `remember_with` takes `RememberOptions`:
   `tags` for every memory drawn from the conversation, `occurred_at`,
   `timezone` and `session_id`. `NewMemory` takes `tags` and `occurred_at`.
-  `occurred_at` is a `Timestamp`, built from a `SystemTime` or an integer
-  (sent as epoch seconds) or a string (sent as-is). `date` still works and is
-  deprecated.
+  `occurred_at` is a `Timestamp`, built from a `SystemTime` (epoch seconds,
+  or RFC 3339 UTC outside the 9-to-11-digit range the server reads as epoch
+  seconds), an integer (sent as given) or a string (sent as-is). `date` still
+  works and is deprecated.
 - **Recall by filter alone.** An empty query lists every memory the filters
   match, newest first; with neither a query nor a filter, `recall_with`
   returns `Error::Usage` without calling the server. `RecallOptions` gains

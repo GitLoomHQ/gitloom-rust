@@ -358,12 +358,53 @@ async fn every_time_field_and_epoch_go_out_as_the_server_spells_them() {
 }
 
 #[test]
-fn a_system_time_is_floored_to_whole_seconds() {
-    let after = UNIX_EPOCH + Duration::from_millis(1500);
-    let before = UNIX_EPOCH - Duration::from_millis(1500);
-    assert_eq!(Timestamp::from(after), Timestamp::Epoch(1));
-    assert_eq!(Timestamp::from(before), Timestamp::Epoch(-2));
-    assert_eq!(Timestamp::from(UNIX_EPOCH), Timestamp::Epoch(0));
+fn a_system_time_in_the_servers_epoch_range_goes_as_seconds() {
+    let t = UNIX_EPOCH + Duration::from_millis(1_760_000_000_999);
+    assert_eq!(Timestamp::from(t), Timestamp::Epoch(1_760_000_000));
+    let first = UNIX_EPOCH + Duration::from_secs(100_000_000);
+    assert_eq!(Timestamp::from(first), Timestamp::Epoch(100_000_000));
+}
+
+#[test]
+fn a_system_time_outside_it_goes_as_rfc3339_utc() {
+    let text = |t| match Timestamp::from(t) {
+        Timestamp::Text(s) => s,
+        other => panic!("expected text, got {other:?}"),
+    };
+    // 1965-04-02T10:00:00Z
+    assert_eq!(
+        text(UNIX_EPOCH - Duration::from_secs(149_868_000)),
+        "1965-04-02T10:00:00Z"
+    );
+    // Floored, not truncated toward the epoch.
+    assert_eq!(
+        text(UNIX_EPOCH - Duration::from_millis(500)),
+        "1969-12-31T23:59:59Z"
+    );
+    assert_eq!(
+        text(UNIX_EPOCH - Duration::from_millis(1500)),
+        "1969-12-31T23:59:58Z"
+    );
+    assert_eq!(text(UNIX_EPOCH), "1970-01-01T00:00:00Z");
+    assert_eq!(
+        text(UNIX_EPOCH + Duration::from_millis(99_999_999_900)),
+        "1973-03-03T09:46:39Z"
+    );
+    // 1964-02-29T12:00:00Z
+    assert_eq!(
+        text(UNIX_EPOCH - Duration::from_secs(184_248_000)),
+        "1964-02-29T12:00:00Z"
+    );
+    assert_eq!(
+        text(UNIX_EPOCH + Duration::from_secs(100_000_000_000)),
+        "5138-11-16T09:46:40Z"
+    );
+}
+
+#[test]
+fn an_explicit_epoch_is_sent_as_given() {
+    assert_eq!(Timestamp::from(-5i64), Timestamp::Epoch(-5));
+    assert_eq!(Timestamp::from(0i64), Timestamp::Epoch(0));
 }
 
 #[tokio::test]

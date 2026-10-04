@@ -194,10 +194,11 @@ client.write(&[NewMemory {
 ```
 
 `occurred_at` is when the thing happened, not when it was written. It takes a
-`SystemTime` (sent as epoch seconds), an integer epoch, or a string sent as-is:
-RFC 3339 with an offset, a date `YYYY-MM-DD` meaning that calendar day, or a
-datetime without an offset, read in `timezone`. `date` still works and is
-deprecated.
+`SystemTime` (sent as epoch seconds, or as RFC 3339 UTC before 1973-03-03,
+where the server would not read the number as one), an integer epoch, or a
+string sent as-is: RFC 3339 with an offset, a date `YYYY-MM-DD` meaning that
+calendar day, or a datetime without an offset, read in `timezone`. `date` still
+works and is deprecated.
 
 Tags are trimmed and lowercased: letters, digits, spaces and `- _ . : / # @`, at
 most 32 of 64 characters each. A refused one comes back as `Error::Api` with

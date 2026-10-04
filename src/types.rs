@@ -1,4 +1,6 @@
-use serde::{Deserialize, Serialize};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 /// One chat message, in the provider's shape. `content` is either text or an
@@ -171,10 +173,30 @@ pub struct Memory {
     #[serde(default)]
     pub excerpted: bool,
 
+    /// The caller's tags first, then the inferred ones.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// The caller's tags alone.
+    #[serde(default)]
+    pub user_tags: Vec<String>,
+    #[deprecated(note = "use created_at")]
     pub created: Option<String>,
+    #[deprecated(note = "use updated_at")]
     pub updated: Option<String>,
+    #[serde(default, deserialize_with = "unix_seconds")]
+    pub created_at: Option<SystemTime>,
+    #[serde(default, deserialize_with = "unix_seconds")]
+    pub updated_at: Option<SystemTime>,
+    /// When the memory's subject happened.
+    #[serde(default, deserialize_with = "unix_seconds")]
+    pub occurred_at: Option<SystemTime>,
+    #[serde(default, deserialize_with = "unix_seconds")]
+    pub expires_at: Option<SystemTime>,
+    /// How `occurred_at` is known: `user`, `extracted`, `said` or `written`.
+    pub occurred_source: Option<String>,
+    /// `instant`, or `day` when only the date is known, held as noon UTC on
+    /// that date.
+    pub occurred_precision: Option<String>,
     pub confidence: Option<f64>,
     #[serde(default)]
     pub cues: Vec<String>,
@@ -364,6 +386,205 @@ pub struct Skill {
     pub matched: Vec<String>,
 }
 
+/// Shapes one conversation write.
+#[derive(Debug, Clone, Default)]
+pub struct RememberOptions {
+    pub namespace: Option<String>,
+    pub session_id: Option<String>,
+    /// Applied to every memory drawn from the conversation.
+    pub tags: Vec<String>,
+    /// When the conversation happened.
+    pub occurred_at: Option<Timestamp>,
+    /// The IANA zone, e.g. `Asia/Kolkata`, that a time without an offset is
+    /// read in.
+    pub timezone: Option<String>,
+    #[deprecated(note = "use occurred_at")]
+    pub date: Option<String>,
+}
+
+/// One already-formed memory to store — the input to
+/// [`Client::write`](crate::Client::write), as [`Memory`] is the output of a
+/// recall.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NewMemory {
+    /// Repo-relative and ending in `.md`, under `facts/`, `incidents/`,
+    /// `rules/` or `skills/`. The directory is the topic.
+    pub path: String,
+    /// Markdown; `##` headings become separately retrievable sections.
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// When what the memory is about happened, not when it was written.
+    /// Backfilled memories without it are all stamped with today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at: Option<Timestamp>,
+    #[deprecated(note = "use occurred_at")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
+    /// In `[0, 1]`; breaks ties between memories that contradict each other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    /// Expires an incident, e.g. `30d`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
+    /// A memory this one replaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    /// Two to five ways someone would later ask for this.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cues: Vec<String>,
+    /// Paths of related memories, optionally labelled
+    /// (`spouse: facts/people/maya.md`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<String>,
+}
+
+/// One memory read back by path.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StoredMemory {
+    #[serde(default)]
+    pub namespace: String,
+    pub path: String,
+    pub title: Option<String>,
+    pub tier: Option<String>,
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default, deserialize_with = "nullable")]
+    pub tags: Vec<String>,
+    pub confidence: Option<f64>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub cues: Vec<String>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub related: Vec<String>,
+    pub created: Option<String>,
+    pub updated: Option<String>,
+}
+
+/// Roots and bounds a table of contents.
+#[derive(Debug, Clone, Default)]
+pub struct TreeOptions {
+    pub namespace: Option<String>,
+    /// Unset is the whole memory.
+    pub path: Option<String>,
+    /// Default 2, at most 8.
+    pub depth: Option<u32>,
+}
+
+/// One level of the table of contents: tier, topic, file, section.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TreeNode {
+    #[serde(default)]
+    pub path: String,
+    pub title: Option<String>,
+    pub kind: Option<String>,
+    pub tier: Option<String>,
+    pub summary: Option<String>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub children: Vec<TreeNode>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TreeResult {
+    #[serde(default)]
+    pub namespace: String,
+    #[serde(default)]
+    pub depth: i64,
+    pub tree: TreeNode,
+    #[serde(default)]
+    pub millis: i64,
+}
+
+/// Narrows a topic listing.
+#[derive(Debug, Clone, Default)]
+pub struct TopicsOptions {
+    pub namespace: Option<String>,
+    /// `facts`, `incidents`, `rules` or `skills`.
+    pub tier: Option<String>,
+    /// Only topics under this path.
+    pub prefix: Option<String>,
+    /// A case-insensitive substring of the topic's name.
+    pub like: Option<String>,
+    pub max_depth: Option<u32>,
+    pub min_files: Option<u32>,
+    pub limit: Option<u32>,
+}
+
+/// One directory in the memory, with how many memories it holds.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Topic {
+    pub path: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub tier: String,
+    #[serde(default)]
+    pub parent: String,
+    #[serde(default)]
+    pub depth: i64,
+    #[serde(default)]
+    pub memories: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TopicsResult {
+    #[serde(default)]
+    pub namespace: String,
+    #[serde(default, deserialize_with = "nullable")]
+    pub topics: Vec<Topic>,
+    #[serde(default)]
+    pub millis: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GraphOptions {
+    pub namespace: Option<String>,
+    pub limit: Option<u32>,
+}
+
+/// One memory in the relationship graph.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GraphNode {
+    pub path: String,
+    #[serde(default)]
+    pub tier: String,
+    #[serde(default)]
+    pub kind: String,
+    pub title: Option<String>,
+}
+
+/// One declared relationship between two memories.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GraphEdge {
+    pub src: String,
+    pub dst: String,
+    pub label: Option<String>,
+    pub origin: Option<String>,
+}
+
+/// `truncated` means the graph was larger than one response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GraphResult {
+    #[serde(default)]
+    pub namespace: String,
+    #[serde(default, deserialize_with = "nullable")]
+    pub nodes: Vec<GraphNode>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub edges: Vec<GraphEdge>,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub millis: i64,
+}
+
+fn nullable<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
 /// The acknowledgement every asynchronous write returns.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Accepted {
@@ -444,8 +665,89 @@ impl ReaderModel {
     }
 }
 
+/// A time as the API reads one: epoch seconds, or a string sent as-is — RFC
+/// 3339 with an offset, a date `YYYY-MM-DD` meaning that calendar day, or a
+/// datetime without an offset, read in the request's zone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Timestamp {
+    Epoch(i64),
+    Text(String),
+}
+
+impl Timestamp {
+    fn as_param(&self) -> String {
+        match self {
+            Timestamp::Epoch(s) => s.to_string(),
+            Timestamp::Text(s) => s.clone(),
+        }
+    }
+}
+
+/// Floored to whole seconds.
+impl From<SystemTime> for Timestamp {
+    fn from(t: SystemTime) -> Self {
+        Timestamp::Epoch(match t.duration_since(UNIX_EPOCH) {
+            Ok(d) => d.as_secs() as i64,
+            Err(e) => {
+                let d = e.duration();
+                -(d.as_secs() as i64) - i64::from(d.subsec_nanos() > 0)
+            }
+        })
+    }
+}
+
+impl From<i64> for Timestamp {
+    fn from(secs: i64) -> Self {
+        Timestamp::Epoch(secs)
+    }
+}
+
+impl From<&str> for Timestamp {
+    fn from(s: &str) -> Self {
+        Timestamp::Text(s.to_string())
+    }
+}
+
+impl From<String> for Timestamp {
+    fn from(s: String) -> Self {
+        Timestamp::Text(s)
+    }
+}
+
+/// Which of a memory's times a range bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeField {
+    /// When the memory's subject happened.
+    Occurred,
+    Created,
+    Updated,
+}
+
+impl TimeField {
+    fn as_param(self) -> &'static str {
+        match self {
+            TimeField::Occurred => "occurred",
+            TimeField::Created => "created",
+            TimeField::Updated => "updated",
+        }
+    }
+}
+
+fn unix_seconds<'de, D: Deserializer<'de>>(d: D) -> Result<Option<SystemTime>, D::Error> {
+    Ok(Option::<i64>::deserialize(d)?.and_then(|s| {
+        let d = Duration::from_secs(s.unsigned_abs());
+        if s >= 0 {
+            UNIX_EPOCH.checked_add(d)
+        } else {
+            UNIX_EPOCH.checked_sub(d)
+        }
+    }))
+}
+
 /// Filters for a retrieval. Every one is applied *inside* each retrieval arm
-/// and to graph neighbours server-side.
+/// and to graph neighbours server-side. With no query, the filters list every
+/// memory they match instead, newest first by `time_field`.
 #[derive(Debug, Clone, Default)]
 pub struct RecallOptions {
     pub namespace: Option<String>,
@@ -459,9 +761,16 @@ pub struct RecallOptions {
     pub tags: Vec<String>,
     /// Every one of these tags.
     pub tags_all: Vec<String>,
-    /// `YYYY-MM-DD` or RFC 3339, over the memory's `updated`.
-    pub since: Option<String>,
-    pub until: Option<String>,
+    /// Bounds on `time_field`. A date-only `until` includes that whole day in
+    /// `tz`.
+    pub since: Option<Timestamp>,
+    pub until: Option<Timestamp>,
+    /// Which time `since` and `until` bound, and which a query-less listing
+    /// orders by. The server's default is [`TimeField::Updated`].
+    pub time_field: Option<TimeField>,
+    /// The IANA zone, e.g. `Asia/Kolkata`, that dates and times without an
+    /// offset are read in.
+    pub tz: Option<String>,
     /// Drop memories scoring below this.
     pub min_score: Option<f64>,
     /// Drop graph neighbours, leaving only what matched the query directly.
@@ -479,6 +788,16 @@ pub struct RecallOptions {
 }
 
 impl RecallOptions {
+    /// Whether a filter says what to list when there is no query.
+    pub(crate) fn has_filter(&self) -> bool {
+        !self.tags.is_empty()
+            || !self.tags_all.is_empty()
+            || self.since.is_some()
+            || self.until.is_some()
+            || !self.tiers.is_empty()
+            || !self.paths.is_empty()
+    }
+
     /// The parameters that differ from the defaults. Nothing is sent for a
     /// field left unset, so a default request carries only `q` and
     /// `namespace`.
@@ -502,10 +821,16 @@ impl RecallOptions {
             }
         }
         if let Some(since) = &self.since {
-            push("since", since.clone());
+            push("since", since.as_param());
         }
         if let Some(until) = &self.until {
-            push("until", until.clone());
+            push("until", until.as_param());
+        }
+        if let Some(field) = self.time_field {
+            push("time_field", field.as_param().to_string());
+        }
+        if let Some(tz) = &self.tz {
+            push("tz", tz.clone());
         }
         if let Some(min) = self.min_score {
             push("min_score", min.to_string());

@@ -3,7 +3,9 @@ use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
 use crate::types::{
-    Accepted, MediaInfo, Message, Mode, RecallOptions, RecallResult, Skill, SkillOptions, Term,
+    Accepted, GraphOptions, GraphResult, MediaInfo, Message, Mode, NewMemory, RecallOptions,
+    RecallResult, RememberOptions, Skill, SkillOptions, StoredMemory, Term, TopicsOptions,
+    TopicsResult, TreeOptions, TreeResult,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.gitloom.cloud";
@@ -91,21 +93,158 @@ impl Client {
 
     /// Submit a conversation for ingestion. Asynchronous by design.
     pub async fn remember(&self, turns: &[Message], namespace: Option<&str>) -> Result<(), Error> {
+        let opts = RememberOptions {
+            namespace: namespace.map(str::to_string),
+            ..Default::default()
+        };
+        self.remember_with(turns, &opts).await
+    }
+
+    /// [`remember`](Client::remember), with tags for every memory drawn from
+    /// the conversation and the time it happened.
+    pub async fn remember_with(
+        &self,
+        turns: &[Message],
+        opts: &RememberOptions,
+    ) -> Result<(), Error> {
         let turns: Vec<Value> = turns
             .iter()
             .map(|m| json!({"role": m.role, "content": m.text()}))
             .collect();
+        let mut body = json!({
+            "namespace": opts.namespace.as_deref().unwrap_or(&self.namespace),
+            "messages": turns,
+        });
+        if let Some(id) = &opts.session_id {
+            body["session_id"] = json!(id);
+        }
+        if !opts.tags.is_empty() {
+            body["tags"] = json!(opts.tags);
+        }
+        if let Some(at) = &opts.occurred_at {
+            body["occurred_at"] = json!(at);
+        }
+        if let Some(tz) = &opts.timezone {
+            body["timezone"] = json!(tz);
+        }
+        #[allow(deprecated)]
+        if let Some(date) = &opts.date {
+            body["date"] = json!(date);
+        }
         let _: Value = self
-            .request(
-                reqwest::Method::POST,
-                "/v1/memories",
-                Some(json!({
-                    "namespace": namespace.unwrap_or(&self.namespace),
-                    "messages": turns,
-                })),
-            )
+            .request(reqwest::Method::POST, "/v1/memories", Some(body))
             .await?;
         Ok(())
+    }
+
+    /// Store already-formed memories, where [`remember`](Client::remember)
+    /// has a model decide what a conversation holds. Asynchronous: the
+    /// memories appear in retrieval within seconds. Send them in batches —
+    /// one call is one commit round.
+    pub async fn write(
+        &self,
+        memories: &[NewMemory],
+        namespace: Option<&str>,
+    ) -> Result<(), Error> {
+        if memories.is_empty() {
+            return Ok(());
+        }
+        for (i, m) in memories.iter().enumerate() {
+            if !m.path.ends_with(".md") {
+                return Err(Error::Usage(format!(
+                    "memory {i}: path {:?} must end in .md",
+                    m.path
+                )));
+            }
+        }
+        let body = json!({
+            "namespace": namespace.unwrap_or(&self.namespace),
+            "memories": memories,
+        });
+        let _: Value = self
+            .request(reqwest::Method::POST, "/v1/memories", Some(body))
+            .await?;
+        Ok(())
+    }
+
+    /// Read one memory by path — a file, or `file.md#section`. This is what
+    /// follows a recall: it returns paths, and this reads what they name.
+    pub async fn get(&self, path: &str, namespace: Option<&str>) -> Result<StoredMemory, Error> {
+        let ns = namespace.unwrap_or(&self.namespace);
+        let path = format!(
+            "/v1/memories?path={}&namespace={}",
+            urlencode(path),
+            urlencode(ns)
+        );
+        self.request(reqwest::Method::GET, &path, None).await
+    }
+
+    /// Delete memories by path. Asynchronous, like every write. They leave
+    /// retrieval; earlier revisions stay in the repository's history.
+    pub async fn forget(&self, paths: &[&str], namespace: Option<&str>) -> Result<(), Error> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let ns = namespace.unwrap_or(&self.namespace);
+        let path = format!(
+            "/v1/memories?path={}&namespace={}",
+            urlencode(&paths.join(",")),
+            urlencode(ns)
+        );
+        let _: Value = self.request(reqwest::Method::DELETE, &path, None).await?;
+        Ok(())
+    }
+
+    /// The table of contents: tier, topic, file, sections, each with a
+    /// summary — what a navigator descends instead of guessing at the words a
+    /// search would need.
+    pub async fn tree(&self, opts: &TreeOptions) -> Result<TreeResult, Error> {
+        let ns = opts.namespace.as_deref().unwrap_or(&self.namespace);
+        let mut path = format!("/v1/tree?namespace={}", urlencode(ns));
+        if let Some(root) = opts.path.as_deref().filter(|p| !p.is_empty()) {
+            path.push_str(&format!("&path={}", urlencode(root)));
+        }
+        if let Some(depth) = opts.depth.filter(|&d| d > 0) {
+            path.push_str(&format!("&depth={depth}"));
+        }
+        self.request(reqwest::Method::GET, &path, None).await
+    }
+
+    /// The topics, with how many memories each holds. Check here before
+    /// filing under a new topic, or `facts/databases` ends up beside
+    /// `facts/database`.
+    pub async fn topics(&self, opts: &TopicsOptions) -> Result<TopicsResult, Error> {
+        let ns = opts.namespace.as_deref().unwrap_or(&self.namespace);
+        let mut path = format!("/v1/topics?namespace={}", urlencode(ns));
+        for (key, value) in [
+            ("tier", &opts.tier),
+            ("prefix", &opts.prefix),
+            ("like", &opts.like),
+        ] {
+            if let Some(v) = value.as_deref().filter(|v| !v.is_empty()) {
+                path.push_str(&format!("&{key}={}", urlencode(v)));
+            }
+        }
+        for (key, value) in [
+            ("max_depth", opts.max_depth),
+            ("min_files", opts.min_files),
+            ("limit", opts.limit),
+        ] {
+            if let Some(n) = value.filter(|&n| n > 0) {
+                path.push_str(&format!("&{key}={n}"));
+            }
+        }
+        self.request(reqwest::Method::GET, &path, None).await
+    }
+
+    /// The relationship graph between memories.
+    pub async fn graph(&self, opts: &GraphOptions) -> Result<GraphResult, Error> {
+        let ns = opts.namespace.as_deref().unwrap_or(&self.namespace);
+        let mut path = format!("/v1/graph?namespace={}", urlencode(ns));
+        if let Some(limit) = opts.limit.filter(|&n| n > 0) {
+            path.push_str(&format!("&limit={limit}"));
+        }
+        self.request(reqwest::Method::GET, &path, None).await
     }
 
     /// Retrieve what is known that bears on the query.
@@ -130,17 +269,29 @@ impl Client {
     /// Retrieve with filters. Each one is applied *inside* every retrieval arm
     /// and to graph neighbours server-side, so confining a query to a
     /// directory is a boundary rather than a cut made after the fact.
+    ///
+    /// An empty query lists every memory the filters match instead, newest
+    /// first by `time_field`, each scored 1. That takes [`Mode::Raw`] and no
+    /// `rank`, and at least one of `tags`, `tags_all`, `since`, `until`,
+    /// `tiers` or `paths`.
     pub async fn recall_with(
         &self,
         query: &str,
         opts: &RecallOptions,
     ) -> Result<RecallResult, Error> {
+        let listing = query.trim().is_empty();
+        if listing && !opts.has_filter() {
+            return Err(Error::Usage(
+                "recall needs a query, or a filter (tags, tags_all, since, until, tiers or paths) \
+                 that says what to list"
+                    .into(),
+            ));
+        }
         let ns = opts.namespace.as_deref().unwrap_or(&self.namespace);
-        let mut path = format!(
-            "/v1/retrieve?q={}&namespace={}",
-            urlencode(query),
-            urlencode(ns)
-        );
+        let mut path = format!("/v1/retrieve?namespace={}", urlencode(ns));
+        if !listing {
+            path.push_str(&format!("&q={}", urlencode(query)));
+        }
         for (key, value) in opts.query_pairs() {
             path.push('&');
             path.push_str(&key);
